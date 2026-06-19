@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.cuda.amp import GradScaler
 from tqdm import tqdm
+import os
+import matplotlib.pyplot as plt
 
 from modules.resnet import ResNet34
 from modules.losses import LovaszSoftmax, BoundaryLoss
@@ -23,40 +25,6 @@ class AverageMeter:
 
 def save_checkpoint(state, path, suffix=""):
     torch.save(state, f"{path}/SENet{suffix}")
-
-
-class WarmupExpDecayLR:
-    """Exponential warmup followed by per-batch exponential decay."""
-
-    def __init__(self, optimizer, base_lr: float, warmup_steps: int, step_decay: float):
-        self.optimizer = optimizer
-        self.base_lr = base_lr
-        self.warmup_steps = max(warmup_steps, 1)
-        self.step_decay = step_decay
-        self.start_lr = base_lr / self.warmup_steps
-        self.step_count = 0
-
-    def step(self):
-        self.step_count += 1
-        if self.step_count <= self.warmup_steps:
-            progress = self.step_count / self.warmup_steps
-            lr = self.start_lr * (self.base_lr / self.start_lr) ** progress
-        else:
-            decay_steps = self.step_count - self.warmup_steps
-            lr = self.base_lr * (self.step_decay ** decay_steps)
-
-        for pg in self.optimizer.param_groups:
-            pg["lr"] = lr
-
-    def get_last_lr(self):
-        return [pg["lr"] for pg in self.optimizer.param_groups]
-
-
-def build_warmup_exp_decay_scheduler(optimizer, lr: float, steps_per_epoch: int, wup_epochs: float = 1.0, lr_decay: float = 0.99):
-    warmup_steps = int(wup_epochs * steps_per_epoch)
-    step_decay = lr_decay ** (1.0 / steps_per_epoch)
-    return WarmupExpDecayLR(optimizer, lr, warmup_steps, step_decay)
-
 
 class CNNTrainer:
     def __init__(self, num_classes: int, loss_weights: torch.Tensor, log_dir: str, device: torch.device, lr: float = 1e-3, momentum: float = 0.9, w_decay: float = 5e-4, aux_loss: bool = True, aux_lambda: float = 0.4, model=None):
@@ -87,6 +55,7 @@ class CNNTrainer:
 
     def train(self, train_loader, num_epochs: int):
         scaler = GradScaler()
+        epoch_losses = []
         for epoch in range(num_epochs):
             if epoch == 0:
                 self._warmup_lr(train_loader)
@@ -100,6 +69,19 @@ class CNNTrainer:
                 "optimizer": self.optimizer.state_dict(),
             }
             save_checkpoint(state, self.log_dir)
+            epoch_losses.append(loss)
+
+        os.makedirs("logs/graphs", exist_ok=True)
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(1, num_epochs + 1), epoch_losses, marker='o', linestyle='-', color='b', label='Training Loss')
+        plt.title('CNNTrainer Training Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.grid(True)
+        plt.legend()
+        graph_name = f"CNNTrainer_{os.path.basename(os.path.normpath(self.log_dir))}_loss.png"
+        plt.savefig(os.path.join("logs/graphs", graph_name))
+        plt.close()
 
     def _warmup_lr(self, loader):
         """Linear warmup for the first epoch."""

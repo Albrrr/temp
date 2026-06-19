@@ -8,6 +8,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchhd import embeddings
 from tqdm import tqdm
+import os
+import matplotlib.pyplot as plt
 
 from modules.resnet import ResNet34
 from modules.losses import LovaszSoftmax, BoundaryLoss
@@ -136,13 +138,30 @@ class _BaseHDTrainer:
         self.class_protos = protos.detach().to(self.device)
 
     def train(self, train_loader, num_epochs: int):
+        seg_losses = []
+        sep_losses = []
         for epoch in range(num_epochs):
             acc, iou, l_seg, l_sep = self._train_epoch(
                 train_loader, epoch, num_epochs)
+            seg_losses.append(l_seg)
+            sep_losses.append(l_sep)
             print(f"[Epoch {epoch+1}/{num_epochs}]  seg={l_seg:.4f}  sep={l_sep:.4f}  acc={acc:.4f}  iou={iou:.4f}")
             net = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
             
             save_checkpoint({"epoch": epoch, "state_dict": net.state_dict(), "optimizer": self.optimizer.state_dict()},self.log_dir)
+
+        os.makedirs("logs/graphs", exist_ok=True)
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(1, num_epochs + 1), seg_losses, marker='o', linestyle='-', color='b', label='Segmentation Loss')
+        plt.plot(range(1, num_epochs + 1), sep_losses, marker='x', linestyle='--', color='r', label='Separation Loss')
+        plt.title(f'{self.__class__.__name__} Training Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.grid(True)
+        plt.legend()
+        graph_name = f"{self.__class__.__name__}_{os.path.basename(os.path.normpath(self.log_dir))}_loss.png"
+        plt.savefig(os.path.join("logs/graphs", graph_name))
+        plt.close()
 
     def validate(self, val_loader):
         self.model.eval()

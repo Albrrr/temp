@@ -10,3 +10,4 @@ fire
 pyquaternion
 matplotlib
 nuscenes-devkit
+matplotlib

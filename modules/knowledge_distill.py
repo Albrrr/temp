@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
+import os
+import matplotlib.pyplot as plt
 
 from modules.resnet import ResNet10, ResNet18
 
@@ -56,21 +58,26 @@ class RKDDistiller:
         else:
             raise ValueError(f"Unsupported student size: {model_size}")
 
-    def distill(self, model_size: str, dataloader, epochs: int, num_classes: int, lr: float = 0.01):
+    def distill(self, model_size: str, dataloader, epochs: int, num_classes: int, lr: float = 0.01, graph_name: str = ""):
         """
         Initializes the student and runs the distillation loop.
         Returns the fully trained student model.
         """
+        if not graph_name:
+            graph_name = self.__class__.__name__
+
         student = self._build_student(model_size, num_classes)
         optimizer = optim.SGD(student.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
         criterion = nn.NLLLoss()
+        
+        epoch_losses = []
 
         for epoch in range(epochs):
             student.train()
             running_loss = 0.0
 
-            for images, _, labels, *_ in tqdm(dataloader, desc=f"[RKD] Epoch {epoch+1}/{epochs}"):
-                images, labels = images.to(self.device), labels.to(self.device)
+            for images, _, labels, *_ in tqdm(dataloader, desc=f"[{graph_name}] Epoch {epoch+1}/{epochs}"):
+                images, labels = images.to(self.device), labels.to(self.device).long()
 
                 with torch.no_grad():
                     t_out = self.teacher(images, return_feat=True)
@@ -103,7 +110,20 @@ class RKDDistiller:
 
                 running_loss += total_loss.item()
 
-            print(f"Epoch {epoch+1} Complete | Avg Loss: {running_loss/len(dataloader):.4f}")
+            avg_loss = running_loss/len(dataloader)
+            epoch_losses.append(avg_loss)
+            print(f"Epoch {epoch+1} Complete | Avg Loss: {avg_loss:.4f}")
+
+        os.makedirs("logs/graphs", exist_ok=True)
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(1, epochs + 1), epoch_losses, marker='o', linestyle='-', color='g', label='Distillation Loss')
+        plt.title(f'{graph_name} Distillation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.grid(True)
+        plt.legend()
+        plt.savefig(os.path.join("logs/graphs", f"{graph_name}_distill_loss.png"))
+        plt.close()
 
         return student
     
@@ -128,17 +148,22 @@ class OnPolicyRKDDistiller(RKDDistiller):
             
         return hard_indices
 
-    def distill(self, model_size: str, dataloader, epochs: int, num_classes: int, lr: float = 0.01):
+    def distill(self, model_size: str, dataloader, epochs: int, num_classes: int, lr: float = 0.01, graph_name: str = ""):
+        if not graph_name:
+            graph_name = self.__class__.__name__
+
         student = self._build_student(model_size, num_classes)
         optimizer = optim.SGD(student.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
         criterion = nn.NLLLoss()
+        
+        epoch_losses = []
 
         for epoch in range(epochs):
             student.train()
             running_loss = 0.0
 
             for images, _, labels, *_ in tqdm(dataloader, desc=f"[On-Policy RKD] Epoch {epoch+1}/{epochs}"):
-                images, labels = images.to(self.device), labels.to(self.device)
+                images, labels = images.to(self.device), labels.to(self.device).long()
 
                 with torch.no_grad():
                     t_out = self.teacher(images, return_feat=True)
@@ -181,6 +206,19 @@ class OnPolicyRKDDistiller(RKDDistiller):
 
                 running_loss += total_loss.item()
 
-            print(f"Epoch {epoch+1} Complete | Avg Loss: {running_loss/len(dataloader):.4f}")
+            avg_loss = running_loss/len(dataloader)
+            epoch_losses.append(avg_loss)
+            print(f"Epoch {epoch+1} Complete | Avg Loss: {avg_loss:.4f}")
+
+        os.makedirs("logs/graphs", exist_ok=True)
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(1, epochs + 1), epoch_losses, marker='o', linestyle='-', color='g', label='Distillation Loss')
+        plt.title(f'{graph_name} Distillation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.grid(True)
+        plt.legend()
+        plt.savefig(os.path.join("logs/graphs", f"{graph_name}_distill_loss.png"))
+        plt.close()
 
         return student
