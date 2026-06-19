@@ -1,0 +1,12 @@
+torch
+torchhd
+numpy
+scipy
+opencv-python
+pyyaml
+tqdm
+Pillow
+fire
+pyquaternion
+matplotlib
+nuscenes-devkit

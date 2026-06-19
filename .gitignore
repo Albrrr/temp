@@ -1,0 +1,12 @@
+__pycache__
+logs
+
+# Dataset files (keep directory structure via .gitkeep / PLACE_FILES_HERE.txt)
+data/nuscenes_raw/maps/
+data/nuscenes_raw/samples/
+data/nuscenes_raw/sweeps/
+data/nuscenes_raw/v1.0-mini/
+data/nuscenes_raw/lidarseg/
+data/nuscenes/sequences/
+data/_incoming/*
+!data/_incoming/PLACE_FILES_HERE.txt
