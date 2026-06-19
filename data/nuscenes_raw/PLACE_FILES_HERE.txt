@@ -1,0 +1,27 @@
+Place your raw nuScenes mini download here.
+
+Expected layout (all under data/nuscenes_raw/):
+
+  maps/              <- from nuScenes mini archive
+  samples/           <- from nuScenes mini archive
+  sweeps/            <- from nuScenes mini archive
+  v1.0-mini/         <- metadata JSONs from nuScenes mini archive
+                        MUST also include from LiDARSeg expansion:
+                          - lidarseg.json
+                          - category.json (overwrites mini version)
+
+  lidarseg/
+    v1.0-mini/       <- LiDARSeg .bin label files
+
+Download LiDARSeg expansion: nuScenes-lidarseg-mini-v1.0.tar.bz2
+Extract the FULL archive into this folder (not just the .bin files).
+The expansion adds lidarseg.json + category.json under v1.0-mini/.
+
+Verify with:
+  python -c "from nuscenes.nuscenes import NuScenes; n=NuScenes('v1.0-mini','data/nuscenes_raw',verbose=False); print('lidarseg records:', len(n.lidarseg))"
+
+After files are in place:
+  python main.py --convert
+
+Converted SemanticKITTI-format data is written to:
+  data/nuscenes/sequences/

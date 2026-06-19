@@ -1,0 +1,4 @@
+Optional drop zone for nuScenes mini and LiDARSeg downloads.
+
+You can place zip archives or unpacked folders here. Once ready, ask to
+have contents moved into data/nuscenes_raw/.
