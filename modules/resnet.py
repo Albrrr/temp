@@ -88,9 +88,9 @@ class ResNet(nn.Module):
         self.semantic_output = nn.Conv2d(128, nclasses, 1)
 
         if self.aux:
-            self.aux_head1 = nn.Conv2d(128, nclasses, 1)
-            self.aux_head2 = nn.Conv2d(128, nclasses, 1)
-            self.aux_head3 = nn.Conv2d(128, nclasses, 1)
+            self.aux_head1 = nn.Conv2d(128 * block.expansion, nclasses, 1)
+            self.aux_head2 = nn.Conv2d(128 * block.expansion, nclasses, 1)
+            self.aux_head3 = nn.Conv2d(128 * block.expansion, nclasses, 1)
 
         if self.use_mlp_proj:
             self.mlp_proj = nn.Sequential(

@@ -142,7 +142,7 @@ class _BaseHDTrainer:
         self.scheduler = WarmupExpDecayLR(self.optimizer, lr, warmup_steps, final_decay)
 
         self.evaluator = iouEval(num_classes, device, ignore_idx)
-        self.scaler = torch.cuda.amp.GradScaler()
+        self.scaler = torch.amp.GradScaler('cuda')
 
     def set_class_protos(self, protos: torch.Tensor):
         """
