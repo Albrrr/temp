@@ -59,6 +59,7 @@ def hd_separation_loss(feats_flat: torch.Tensor, proj_weight: torch.Tensor, clas
     else:
         q = s
 
+    q = q + 1e-8 # Prevent dividing by zero
     q_norm = F.normalize(q, dim=1)
     sims = q_norm @ class_protos.t()
     
@@ -141,6 +142,7 @@ class _BaseHDTrainer:
         self.scheduler = WarmupExpDecayLR(self.optimizer, lr, warmup_steps, final_decay)
 
         self.evaluator = iouEval(num_classes, device, ignore_idx)
+        self.scaler = torch.cuda.amp.GradScaler()
 
     def set_class_protos(self, protos: torch.Tensor):
         """
@@ -192,7 +194,8 @@ class _BaseHDTrainer:
         return acc.item(), iou.item()
 
     def _seg_loss(self, pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        return (self.criterion(torch.log(pred.clamp(min=1e-8)), labels) + 1.5 * self.ls(pred, labels.long()) + self.bd(pred, labels))
+        pred_safe = torch.nan_to_num(pred, nan=1e-8, posinf=1.0, neginf=1e-8).clamp(min=1e-8, max=1.0)
+        return (self.criterion(torch.log(pred_safe), labels) + 1.5 * self.ls(pred_safe, labels.long()) + self.bd(pred_safe, labels))
 
     def _full_seg_loss(self, in_vol, proj_labels):
         """Standard forward + seg loss. Returns (loss, pred)."""
@@ -251,6 +254,7 @@ class TeZOTrainer(_BaseHDTrainer):
         self.zo_lr = zo_lr
         self.head_param_names = head_param_names
 
+        os.makedirs(self.log_dir, exist_ok=True)
         self.stats_file = open(os.path.join(self.log_dir, "tezo_stats.csv"), "w")
         self.stats_file.write("step,g_scalar,accum_norm,ema_grad_norm,loss_pos,loss_neg\n")
         self.global_step = 0
@@ -323,6 +327,8 @@ class TeZOTrainer(_BaseHDTrainer):
                 p.data.add_(zs[n], alpha=eps)
 
             g_scalar = (loss_pos - loss_neg) / (2 * eps)
+            g_scalar = torch.nan_to_num(g_scalar, nan=0.0, posinf=1000.0, neginf=-1000.0)
+            
             for n, _ in self._backbone_params:
                 accumulated[n].add_(zs[n], alpha=g_scalar.item())
 
@@ -331,6 +337,12 @@ class TeZOTrainer(_BaseHDTrainer):
 
         for n in accumulated:
             accumulated[n].div_(self.zo_n_samples)
+
+        accum_norm_val = sum(accumulated[n].norm().item()**2 for n in accumulated)**0.5 # Clip accumulated ZO gradients
+        if accum_norm_val > 100.0:
+            clip_coef = 100.0 / (accum_norm_val + 1e-6)
+            for n in accumulated:
+                accumulated[n].mul_(clip_coef)
 
         β = self.zo_ema_beta
         for n, p in self._backbone_params:
@@ -368,8 +380,9 @@ class TeZOTrainer(_BaseHDTrainer):
             with torch.cuda.amp.autocast():
                 seg_loss, pred = self._full_seg_loss(in_vol, proj_labels)
 
-            seg_loss.backward()
-            self.head_optimizer.step()
+            self.scaler.scale(seg_loss).backward()
+            self.scaler.step(self.head_optimizer)
+            self.scaler.update()
             self.scheduler.step()
 
             with torch.no_grad():
@@ -393,6 +406,10 @@ class TeZOTrainer(_BaseHDTrainer):
 
         return acc_m.avg, iou_m.avg, seg_m.avg, sep_m.avg
 
+    def __del__(self):
+        if hasattr(self, 'stats_file') and not self.stats_file.closed:
+            self.stats_file.close()
+
 class DFATrainer(_BaseHDTrainer):
     """
     Direct Feedback Alignment trainer.
@@ -406,6 +423,7 @@ class DFATrainer(_BaseHDTrainer):
         self.dfa_layer_names = dfa_layer_names
         self.dfa_lr = dfa_lr
 
+        os.makedirs(self.log_dir, exist_ok=True)
         self.stats_file = open(os.path.join(self.log_dir, "dfa_stats.csv"), "w")
         self.stats_file.write("step,delta_norm,grad_norm_backbone,grad_norm_head\n")
         self.global_step = 0
@@ -484,7 +502,8 @@ class DFATrainer(_BaseHDTrainer):
                 delta = self._delta[name].to(grad.dtype)
                 if delta.shape[2:] != grad.shape[2:]:
                     delta = F.interpolate(delta, size=grad.shape[2:], mode='bilinear', align_corners=False)
-                return grad + delta
+                scale = self.scaler.get_scale() if hasattr(self, 'scaler') else 1.0
+                return grad + delta * scale
             
             out.register_hook(tensor_backward_hook)
         return forward_hook
@@ -564,7 +583,10 @@ class DFATrainer(_BaseHDTrainer):
 
                 self._compute_dfa_deltas(feats.detach(), proj_labels)
 
-            seg_loss.backward()
+            self.scaler.scale(seg_loss).backward()
+
+            self.scaler.unscale_(self.head_optimizer)
+            self.scaler.unscale_(self.backbone_optimizer)
 
             delta_norm = sum(d.norm().item()**2 for d in self._delta.values())**0.5
             grad_norm_backbone = sum(p.grad.norm().item()**2 for p in self.backbone_optimizer.param_groups[0]['params'] if p.grad is not None)**0.5
@@ -575,8 +597,10 @@ class DFATrainer(_BaseHDTrainer):
                 self.stats_file.write(f"{self.global_step},{delta_norm:.4f},{grad_norm_backbone:.4f},{grad_norm_head:.4f}\n")
                 self.stats_file.flush()
 
-            self.head_optimizer.step()
-            self.backbone_optimizer.step()
+            self.scaler.step(self.head_optimizer)
+            self.scaler.step(self.backbone_optimizer)
+            self.scaler.update()
+
             self.scheduler.step()
             self.backbone_scheduler.step()
 
@@ -593,5 +617,7 @@ class DFATrainer(_BaseHDTrainer):
         return acc_m.avg, iou_m.avg, seg_m.avg, sep_m.avg
 
     def __del__(self):
-        for h in self._hooks:
+        if hasattr(self, 'stats_file') and not self.stats_file.closed:
+            self.stats_file.close()
+        for h in getattr(self, '_hooks', []):
             h.remove()
