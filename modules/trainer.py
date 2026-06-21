@@ -23,6 +23,26 @@ class AverageMeter:
         self.count += n
         self.avg = self.sum / self.count
 
+class WarmupExpDecayLR:
+    def __init__(self, optimizer, base_lr, warmup_steps, decay_rate):
+        self.optimizer = optimizer
+        self.base_lr = base_lr
+        self.warmup_steps = warmup_steps
+        self.decay_rate = decay_rate
+        self.current_step = 0
+
+    def step(self):
+        if self.current_step < self.warmup_steps:
+            lr = self.base_lr * (self.current_step + 1) / max(1, self.warmup_steps)
+        else:
+            decay_steps = self.current_step - self.warmup_steps + 1
+            lr = self.base_lr * (self.decay_rate ** decay_steps)
+            
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+            
+        self.current_step += 1
+
 def save_checkpoint(state, path, suffix=""):
     torch.save(state, f"{path}/SENet{suffix}")
 

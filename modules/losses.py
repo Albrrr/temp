@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
+import math
 
 try:
     from itertools import ifilterfalse
@@ -111,4 +112,42 @@ class BoundaryLoss(nn.Module):
         R = torch.sum(pred_b * gt_b, dim=2) / (torch.sum(gt_b, dim=2) + 1e-7)
         BF1 = 2 * P * R / (P + R + 1e-7)
         loss = torch.mean(1 - BF1)
+        return loss
+
+class DeCovLoss(nn.Module):
+    def __init__(self):
+        super(DeCovLoss, self).__init__()
+
+    def forward(self, x):
+        N = x.size(0)
+        if N <= 1:
+            return torch.tensor(0.0, device=x.device)
+        x = x - x.mean(dim=0, keepdim=True)
+        cov = (x.t() @ x) / (N - 1)
+        cov_diag = torch.diag(cov)
+        loss = 0.5 * (cov.pow(2).sum() - cov_diag.pow(2).sum())
+        return loss
+
+class ArcFaceLoss(nn.Module):
+    def __init__(self, s=30.0, m=0.5):
+        super(ArcFaceLoss, self).__init__()
+        self.s = s
+        self.m = m
+        self.cos_m = math.cos(m)
+        self.sin_m = math.sin(m)
+        self.th = math.cos(math.pi - m)
+        self.mm = math.sin(math.pi - m) * m
+
+    def forward(self, cosine, labels):
+        sine = torch.sqrt(1.0 - torch.pow(cosine, 2).clamp(0, 1))
+        phi = cosine * self.cos_m - sine * self.sin_m
+        phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+        
+        one_hot = torch.zeros(cosine.size(), device=cosine.device)
+        one_hot.scatter_(1, labels.view(-1, 1).long(), 1)
+        
+        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        output *= self.s
+        
+        loss = F.cross_entropy(output, labels)
         return loss

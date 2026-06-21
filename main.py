@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from dataset.parser import Parser
-from modules.resnet import ResNet10, ResNet18, ResNet34
+from modules.resnet import ResNet10, ResNet18, ResNet34, ResNet50, ResNet101, ResNet152, get_model
 from modules.separation_trainers import TeZOTrainer, DFATrainer
 from modules.trainer import CNNTrainer
 from modules.knowledge_distill import RKDDistiller
@@ -18,12 +18,25 @@ TRAIN_TEZO = True
 TRAIN_DFA = True
 TRAIN_BASELINE = True
 
+TEACHERS_ONLY = True
+STUDENTS_ONLY = False
+
 HD_DIM = 10000
 FEAT_DIM = 128
 TEACHER_FEATURE_EXTRACTOR_EPOCHS = 80
 STUDENT_FEATURE_EXTRACTOR_EPOCHS = 80
 HDC_RETRAIN_EPOCHS = 10
-STUDENT_SIZE = "resnet10"
+
+# Options for TEACHER_SIZE and STUDENT_SIZE:
+# - 'resnet10' : Very small model (often used for student)
+# - 'resnet18' : Small model (often used for student)
+# - 'resnet34' : Standard model (BasicBlock)
+# - 'resnet50' : Larger model (Bottleneck, takes more VRAM)
+# - 'resnet101': Much larger model
+# - 'resnet152': Extremely large model, ideal for ~90GB VRAM setups
+
+TEACHER_SIZE = "resnet152"
+STUDENT_SIZE = "resnet34"
 
 data_root = "data/nuscenes" 
 
@@ -83,52 +96,83 @@ def main():
     os.makedirs("logs/baseline", exist_ok=True)
 
     if TRAIN_TEZO:
-        print("\n--- [Branch 1] Training TeZO Teacher (ResNet34) ---")
-        tezo_trainer = TeZOTrainer(
-            num_classes=num_classes, loss_weights=loss_weights, hd_dim=HD_DIM, feat_dim=FEAT_DIM,
-            log_dir="logs/tezo_teacher", device=device, steps_per_epoch=len(train_loader)
-        )
-        tezo_trainer.rp_weight = common_rp_weight
-        tezo_trainer.set_class_protos(random_protos)
-        tezo_trainer.train(train_loader, TEACHER_FEATURE_EXTRACTOR_EPOCHS)
+        if not STUDENTS_ONLY:
+            print(f"\n--- [Branch 1] Training TeZO Teacher ({TEACHER_SIZE}) ---")
+            tezo_model = get_model(TEACHER_SIZE, num_classes, aux=True)
+            tezo_trainer = TeZOTrainer(
+                num_classes=num_classes, loss_weights=loss_weights, hd_dim=HD_DIM, feat_dim=FEAT_DIM,
+                log_dir="logs/tezo_teacher", device=device, steps_per_epoch=len(train_loader),
+                model=tezo_model
+            )
+            tezo_trainer.rp_weight = common_rp_weight
+            tezo_trainer.set_class_protos(random_protos)
+            tezo_trainer.train(train_loader, TEACHER_FEATURE_EXTRACTOR_EPOCHS)
+            tezo_teacher_model = tezo_trainer.model
+        else:
+            print(f"\n--- [Branch 1] SKIPPED: TeZO Teacher Training (Loading Checkpoint) ---")
+            tezo_teacher_model = get_model(TEACHER_SIZE, num_classes, aux=True)
+            ckpt_path = "logs/tezo_teacher/SENet"
+            if os.path.exists(ckpt_path):
+                tezo_teacher_model.load_state_dict(torch.load(ckpt_path)["state_dict"])
+            else:
+                print(f"[WARNING] Teacher checkpoint not found at {ckpt_path}")
+            tezo_teacher_model.to(device)
 
-        print(f"\n--- [Branch 1] Distilling TeZO Teacher -> Student ({STUDENT_SIZE}) ---")
-        distiller_tezo = RKDDistiller(tezo_trainer.model, device)
-        tezo_student = distiller_tezo.distill(model_size=STUDENT_SIZE, dataloader=train_loader, epochs=STUDENT_FEATURE_EXTRACTOR_EPOCHS, num_classes=num_classes, graph_name="TeZO")
-        torch.save({"state_dict": tezo_student.state_dict()}, "logs/tezo_student/SENet")
+        if not TEACHERS_ONLY:
+            print(f"\n--- [Branch 1] Distilling TeZO Teacher -> Student ({STUDENT_SIZE}) ---")
+            distiller_tezo = RKDDistiller(tezo_teacher_model, device)
+            tezo_student = distiller_tezo.distill(model_size=STUDENT_SIZE, dataloader=train_loader, epochs=STUDENT_FEATURE_EXTRACTOR_EPOCHS, num_classes=num_classes, graph_name="TeZO")
+            torch.save({"state_dict": tezo_student.state_dict()}, "logs/tezo_student/SENet")
     else:
         print("\n--- [Branch 1] SKIPPED: TeZO Training & Distillation ---")
 
     if TRAIN_DFA:
-        print("\n--- [Branch 2] Training DFA Teacher (ResNet34) ---")
-        dfa_trainer = DFATrainer(
-            num_classes=num_classes, loss_weights=loss_weights, hd_dim=HD_DIM, feat_dim=FEAT_DIM,
-            log_dir="logs/dfa_teacher", device=device, steps_per_epoch=len(train_loader)
-        )
-        dfa_trainer.rp_weight = common_rp_weight
-        dfa_trainer.set_class_protos(random_protos)
-        dfa_trainer.train(train_loader, TEACHER_FEATURE_EXTRACTOR_EPOCHS)
+        if not STUDENTS_ONLY:
+            print(f"\n--- [Branch 2] Training DFA Teacher ({TEACHER_SIZE}) ---")
+            dfa_model = get_model(TEACHER_SIZE, num_classes, aux=True)
+            dfa_trainer = DFATrainer(
+                num_classes=num_classes, loss_weights=loss_weights, hd_dim=HD_DIM, feat_dim=FEAT_DIM,
+                log_dir="logs/dfa_teacher", device=device, steps_per_epoch=len(train_loader),
+                model=dfa_model
+            )
+            dfa_trainer.rp_weight = common_rp_weight
+            dfa_trainer.set_class_protos(random_protos)
+            dfa_trainer.train(train_loader, TEACHER_FEATURE_EXTRACTOR_EPOCHS)
+            dfa_teacher_model = dfa_trainer.model
+        else:
+            print(f"\n--- [Branch 2] SKIPPED: DFA Teacher Training (Loading Checkpoint) ---")
+            dfa_teacher_model = get_model(TEACHER_SIZE, num_classes, aux=True)
+            ckpt_path = "logs/dfa_teacher/SENet"
+            if os.path.exists(ckpt_path):
+                dfa_teacher_model.load_state_dict(torch.load(ckpt_path)["state_dict"])
+            else:
+                print(f"[WARNING] Teacher checkpoint not found at {ckpt_path}")
+            dfa_teacher_model.to(device)
 
-        print(f"\n--- [Branch 2] Distilling DFA Teacher -> Student ({STUDENT_SIZE}) ---")
-        distiller_dfa = RKDDistiller(dfa_trainer.model, device)
-        dfa_student = distiller_dfa.distill(model_size=STUDENT_SIZE, dataloader=train_loader, epochs=STUDENT_FEATURE_EXTRACTOR_EPOCHS, num_classes=num_classes, graph_name="DFA")
-        torch.save({"state_dict": dfa_student.state_dict()}, "logs/dfa_student/SENet")
+        if not TEACHERS_ONLY:
+            print(f"\n--- [Branch 2] Distilling DFA Teacher -> Student ({STUDENT_SIZE}) ---")
+            distiller_dfa = RKDDistiller(dfa_teacher_model, device)
+            dfa_student = distiller_dfa.distill(model_size=STUDENT_SIZE, dataloader=train_loader, epochs=STUDENT_FEATURE_EXTRACTOR_EPOCHS, num_classes=num_classes, graph_name="DFA")
+            torch.save({"state_dict": dfa_student.state_dict()}, "logs/dfa_student/SENet")
     else:
         print("\n--- [Branch 2] SKIPPED: DFA Training & Distillation ---")
 
-    if TRAIN_BASELINE:
+    if TRAIN_BASELINE and not TEACHERS_ONLY:
         print(f"\n--- [Branch 3] Training Baseline Student ({STUDENT_SIZE}) ---")
-        if STUDENT_SIZE == "resnet10":
-            baseline_model = ResNet10(num_classes)
-        else:
-            baseline_model = ResNet18(num_classes)
+        baseline_model = get_model(STUDENT_SIZE, num_classes, aux=False)
             
         baseline_trainer = CNNTrainer(num_classes=num_classes, loss_weights=loss_weights, log_dir="logs/baseline", device=device, model=baseline_model, aux_loss=False)
         baseline_trainer.train(train_loader, TEACHER_FEATURE_EXTRACTOR_EPOCHS)
 
         torch.save({"state_dict": baseline_trainer.model.state_dict()}, "logs/baseline/SENet")
+    elif TRAIN_BASELINE and TEACHERS_ONLY:
+        print("\n--- [Branch 3] SKIPPED: Baseline Training (TEACHERS_ONLY is True) ---")
     else:
         print("\n--- [Branch 3] SKIPPED: Baseline Training ---")
+
+    if TEACHERS_ONLY:
+        print("\n--- Evaluation SKIPPED: TEACHERS_ONLY is True ---")
+        return
 
     def eval_hdc(path, model_type, name):
         if not os.path.exists(path):

@@ -6,7 +6,7 @@ from tqdm import tqdm
 import os
 import matplotlib.pyplot as plt
 
-from modules.resnet import ResNet10, ResNet18
+from modules.resnet import get_model
 
 def pdist(e, squared=False, eps=1e-12):
     e_square = e.pow(2).sum(dim=1)
@@ -51,12 +51,7 @@ class RKDDistiller:
 
     def _build_student(self, model_size: str, num_classes: int):
         """Builds a smaller ResNet based on the requested size."""
-        if model_size == "resnet18":
-            return ResNet18(num_classes).to(self.device)
-        elif model_size == "resnet10":
-            return ResNet10(num_classes).to(self.device)
-        else:
-            raise ValueError(f"Unsupported student size: {model_size}")
+        return get_model(model_size, num_classes, aux=False).to(self.device)
 
     def distill(self, model_size: str, dataloader, epochs: int, num_classes: int, lr: float = 0.01, graph_name: str = ""):
         """

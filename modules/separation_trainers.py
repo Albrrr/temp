@@ -12,7 +12,8 @@ import os
 import matplotlib.pyplot as plt
 
 from modules.resnet import ResNet34
-from modules.losses import LovaszSoftmax, BoundaryLoss
+from modules.losses import LovaszSoftmax, BoundaryLoss, ArcFaceLoss, DeCovLoss
+from modules.ioueval import iouEval
 from modules.ioueval import iouEval
 from modules.trainer import AverageMeter, WarmupExpDecayLR, save_checkpoint
 
@@ -35,19 +36,14 @@ def ste_quantise(x: torch.Tensor) -> torch.Tensor:
     return STEQuantise.apply(x)
 
 
-def hd_separation_loss(feats_flat: torch.Tensor, proj_weight: torch.Tensor, class_protos: torch.Tensor, labels_flat: torch.Tensor, ignore_index: int = 0, temperature: float = 0.1, max_pixels: int = 4096, hard_quantize: bool = True) -> torch.Tensor:
+def hd_separation_loss(feats_flat: torch.Tensor, proj_weight: torch.Tensor, class_protos: torch.Tensor, labels_flat: torch.Tensor, ignore_index: int = 0, temperature: float = 0.1, max_pixels: int = 4096, hard_quantize: bool = True, sep_criterion=None) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Per-pixel InfoNCE contrastive loss in HD space.
-
-    Memory note: N can be ~32 768 per image and hd_dim = 10 000.  The full
-    similarity matrix would be NxC which is fine (32768x17), but the
-    intermediate (N, hd_dim) projection is ~1.3 GB in float32 for N=32768.
-    We therefore subsample `max_pixels` pixels per call.
+    Per-pixel InfoNCE/ArcFace contrastive loss in HD space.
     """
     valid_mask = labels_flat != ignore_index
     valid_idx = valid_mask.nonzero(as_tuple=False).squeeze(1)
     if valid_idx.numel() == 0:
-        return feats_flat.new_zeros(1).squeeze()
+        return feats_flat.new_zeros(1).squeeze(), valid_idx
 
     if valid_idx.numel() > max_pixels:
         perm = torch.randperm(valid_idx.numel(), device=feats_flat.device)
@@ -65,10 +61,18 @@ def hd_separation_loss(feats_flat: torch.Tensor, proj_weight: torch.Tensor, clas
 
     q_norm = F.normalize(q, dim=1)
     sims = q_norm @ class_protos.t()
-    sims = sims / temperature
+    
+    if sep_criterion is not None:
+        if isinstance(sep_criterion, ArcFaceLoss):
+            loss = sep_criterion(sims, labels_sub)
+        else:
+            sims = sims / temperature
+            loss = sep_criterion(sims, labels_sub)
+    else:
+        sims = sims / temperature
+        loss = F.cross_entropy(sims, labels_sub)
 
-    loss = F.cross_entropy(sims, labels_sub)
-    return loss
+    return loss, valid_idx
 
 class _BaseHDTrainer:
     """
@@ -82,6 +86,7 @@ class _BaseHDTrainer:
         feat_dim: int,
         log_dir: str,
         device: torch.device,
+        model: nn.Module = None,
         lr: float = 0.01,
         momentum: float = 0.9,
         w_decay: float = 1e-4,
@@ -94,6 +99,8 @@ class _BaseHDTrainer:
         sep_temperature: float = 0.1,
         sep_max_pixels: int = 4096,
         ignore_index: int = 0,
+        decov_weight: float = 0.1,
+        use_arcface: bool = True,
     ):
         self.num_classes = num_classes
         self.hd_dim = hd_dim
@@ -106,13 +113,19 @@ class _BaseHDTrainer:
         self.sep_temperature = sep_temperature
         self.sep_max_pixels = sep_max_pixels
         self.ignore_index = ignore_index
+        self.decov_weight = decov_weight
 
         ignore_idx = (loss_weights < 1e-10).nonzero(as_tuple=True)[0].tolist()
 
-        if hasattr(self, 'model_override'):
+        if model is not None:
+            self.model = model.to(device)
+        elif hasattr(self, 'model_override'):
             self.model = self.model_override
         else:
-            self.model = ResNet34(num_classes, aux=aux_loss).to(device)
+            self.model = ResNet34(num_classes, aux=aux_loss, use_mlp_proj=True, use_l2_norm=True).to(device)
+
+        self.arcface = ArcFaceLoss().to(device) if use_arcface else None
+        self.decov = DeCovLoss().to(device)
 
         _proj_emb = embeddings.Projection(feat_dim, hd_dim)
         self.rp_weight = _proj_emb.weight.detach().to(device)
@@ -194,16 +207,27 @@ class _BaseHDTrainer:
             loss = self._seg_loss(pred, proj_labels)
         return loss, pred
 
-    def _sep_loss_from_feats(self, feats: torch.Tensor, proj_labels: torch.Tensor) -> torch.Tensor:
-        """Project features via RP, apply STE, compute InfoNCE separation loss."""
+    def _sep_loss_from_feats(self, feats: torch.Tensor, pre_norm_feats: torch.Tensor, proj_labels: torch.Tensor) -> torch.Tensor:
+        """Project features via RP, apply STE, compute ArcFace and DeCov separation loss."""
         B, C_f, H, W = feats.shape
         feats_flat = feats.permute(0, 2, 3, 1).reshape(-1, C_f)
+        pre_feats_flat = pre_norm_feats.permute(0, 2, 3, 1).reshape(-1, C_f)
         labels_flat = proj_labels.reshape(-1)
-        return hd_separation_loss(
+        
+        sep_loss, valid_idx = hd_separation_loss(
             feats_flat, self.rp_weight, self.class_protos,
             labels_flat, self.ignore_index,
             self.sep_temperature, self.sep_max_pixels,
+            sep_criterion=self.arcface
         )
+        
+        if valid_idx.numel() > 0:
+            decov_loss = self.decov(pre_feats_flat[valid_idx])
+            loss = sep_loss + self.decov_weight * decov_loss
+        else:
+            loss = sep_loss
+            
+        return loss
 
     def _eval_metrics(self, pred, proj_labels):
         self.evaluator.reset()
@@ -219,12 +243,17 @@ class TeZOTrainer(_BaseHDTrainer):
     """
     DEFAULT_HEAD_NAMES = ("conv_1", "conv_2", "semantic_output", "aux_head")
 
-    def __init__(self, num_classes: int, loss_weights: torch.Tensor, hd_dim: int, feat_dim: int = 128, log_dir: str = "logs", device: torch.device = torch.device("cpu"), zo_epsilon: float = 1e-3, zo_ema_beta: float = 0.9, zo_n_samples: int = 1, head_param_names: Tuple[str, ...] = DEFAULT_HEAD_NAMES, **base_kwargs):
+    def __init__(self, num_classes: int, loss_weights: torch.Tensor, hd_dim: int, feat_dim: int = 128, log_dir: str = "logs", device: torch.device = torch.device("cpu"), zo_epsilon: float = 1e-3, zo_ema_beta: float = 0.9, zo_n_samples: int = 1, zo_lr: float = 1e-5, head_param_names: Tuple[str, ...] = DEFAULT_HEAD_NAMES, **base_kwargs):
         super().__init__(num_classes, loss_weights, hd_dim, feat_dim, log_dir, device, **base_kwargs)
         self.zo_epsilon = zo_epsilon
         self.zo_ema_beta = zo_ema_beta
         self.zo_n_samples = zo_n_samples
+        self.zo_lr = zo_lr
         self.head_param_names = head_param_names
+
+        self.stats_file = open(os.path.join(self.log_dir, "tezo_stats.csv"), "w")
+        self.stats_file.write("step,g_scalar,accum_norm,ema_grad_norm,loss_pos,loss_neg\n")
+        self.global_step = 0
 
         self._ema_grads: Dict[str, torch.Tensor] = {
             name: torch.zeros_like(p)
@@ -253,15 +282,18 @@ class TeZOTrainer(_BaseHDTrainer):
         """
         net = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
-        out = net(in_vol, return_feat=True)
+        out = net(in_vol, return_feat=True, return_pre_feat=True)
         
         if self.aux_loss:
-            pred, _, feats = out
+            pred, aux, feats, pre_feats = out
+            z2, z4, z8 = aux
+            lam = self.aux_lambda
+            l_seg = (self._seg_loss(pred, proj_labels) + lam * self._seg_loss(z2, proj_labels) + lam * self._seg_loss(z4, proj_labels) + lam * self._seg_loss(z8, proj_labels))
         else:
-            pred, feats = out
+            pred, feats, pre_feats = out
+            l_seg = self._seg_loss(pred, proj_labels)
 
-        l_seg = F.nll_loss(torch.log(pred.clamp(min=1e-8)), proj_labels, weight=self.criterion.weight, ignore_index=self.ignore_index,)
-        l_sep = self._sep_loss_from_feats(feats, proj_labels)
+        l_sep = self._sep_loss_from_feats(feats, pre_feats, proj_labels)
 
         return l_seg + (self.sep_lambda * l_sep)
 
@@ -272,6 +304,9 @@ class TeZOTrainer(_BaseHDTrainer):
         """
         eps = self.zo_epsilon
         accumulated = {n: torch.zeros_like(p) for n, p in self._backbone_params}
+
+        was_training = self.model.training
+        self.model.eval()
 
         for _ in range(self.zo_n_samples):
             zs = {n: torch.randn_like(p) for n, p in self._backbone_params}
@@ -291,6 +326,9 @@ class TeZOTrainer(_BaseHDTrainer):
             for n, _ in self._backbone_params:
                 accumulated[n].add_(zs[n], alpha=g_scalar.item())
 
+        if was_training:
+            self.model.train()
+
         for n in accumulated:
             accumulated[n].div_(self.zo_n_samples)
 
@@ -298,8 +336,18 @@ class TeZOTrainer(_BaseHDTrainer):
         for n, p in self._backbone_params:
             self._ema_grads[n].mul_(β).add_(accumulated[n], alpha=1 - β)
 
-        lr = self.head_optimizer.param_groups[0]["lr"]
+        accum_norm = sum(accumulated[n].norm().item()**2 for n in accumulated)**0.5
+        ema_norm = sum(self._ema_grads[n].norm().item()**2 for n in self._ema_grads)**0.5
+        if hasattr(self, 'stats_file'):
+            self.global_step += 1
+            self.stats_file.write(f"{self.global_step},{g_scalar.item():.4f},{accum_norm:.4f},{ema_norm:.4f},{loss_pos.item():.4f},{loss_neg.item():.4f}\n")
+            self.stats_file.flush()
+
+        lr = self.zo_lr
+        wd = self.head_optimizer.param_groups[0]["weight_decay"]
         for n, p in self._backbone_params:
+            if wd > 0:
+                p.data.mul_(1.0 - lr * wd)
             p.data.add_(self._ema_grads[n], alpha=-lr)
 
     def _train_epoch(self, loader, epoch, total_epochs):
@@ -327,10 +375,12 @@ class TeZOTrainer(_BaseHDTrainer):
             with torch.no_grad():
                 net = self.model.module if isinstance(
                     self.model, nn.DataParallel) else self.model
-                feats = net(in_vol, only_feat=True).detach()
+                feats, pre_feats = net(in_vol, only_feat=True, return_pre_feat=True)
+                feats = feats.detach()
+                pre_feats = pre_feats.detach()
 
             with torch.no_grad():
-                sep_loss = self.sep_lambda * self._sep_loss_from_feats(feats, proj_labels)
+                sep_loss = self.sep_lambda * self._sep_loss_from_feats(feats, pre_feats, proj_labels)
             sep_loss_val = sep_loss.item()
 
             with torch.no_grad():
@@ -356,6 +406,10 @@ class DFATrainer(_BaseHDTrainer):
         self.dfa_layer_names = dfa_layer_names
         self.dfa_lr = dfa_lr
 
+        self.stats_file = open(os.path.join(self.log_dir, "dfa_stats.csv"), "w")
+        self.stats_file.write("step,delta_norm,grad_norm_backbone,grad_norm_head\n")
+        self.global_step = 0
+
         head_params     = [p for n, p in self.model.named_parameters() if any(h in n for h in self.HEAD_PARAM_NAMES)]
         backbone_params = [p for n, p in self.model.named_parameters() if not any(h in n for h in self.HEAD_PARAM_NAMES)]
 
@@ -371,6 +425,12 @@ class DFATrainer(_BaseHDTrainer):
             weight_decay=self.optimizer.param_groups[0]["weight_decay"],
         )
         self.optimizer = self.head_optimizer
+        self.backbone_scheduler = WarmupExpDecayLR(
+            self.backbone_optimizer,
+            self.dfa_lr,
+            self.scheduler.warmup_steps,
+            self.scheduler.decay_rate
+        )
 
         self._feedback: Dict[str, torch.Tensor] = {}
         self._layer_out_shape: Dict[str, torch.Size] = {}
@@ -421,7 +481,10 @@ class DFATrainer(_BaseHDTrainer):
             def tensor_backward_hook(grad):
                 if name not in self._delta:
                     return grad
-                return grad + self._delta[name].to(grad.dtype) 
+                delta = self._delta[name].to(grad.dtype)
+                if delta.shape[2:] != grad.shape[2:]:
+                    delta = F.interpolate(delta, size=grad.shape[2:], mode='bilinear', align_corners=False)
+                return grad + delta
             
             out.register_hook(tensor_backward_hook)
         return forward_hook
@@ -482,26 +545,40 @@ class DFATrainer(_BaseHDTrainer):
             proj_labels = proj_labels.to(self.device).long()
             N = in_vol.size(0)
 
-            with torch.no_grad():
-                feats = net(in_vol, only_feat=True)
-
-            self._compute_dfa_deltas(feats, proj_labels)
-
-            with torch.enable_grad():
-                sep_loss = self.sep_lambda * self._sep_loss_from_feats(feats, proj_labels)
-            sep_loss_val = sep_loss.item()
-
             self.head_optimizer.zero_grad()
             self.backbone_optimizer.zero_grad()
 
             with torch.cuda.amp.autocast():
-                seg_loss, pred = self._full_seg_loss(in_vol, proj_labels)
+                out = net(in_vol, return_feat=True, return_pre_feat=True)
+                if self.aux_loss:
+                    pred, aux, feats, pre_feats = out
+                    z2, z4, z8 = aux
+                    lam = self.aux_lambda
+                    seg_loss = (self._seg_loss(pred, proj_labels) + lam * self._seg_loss(z2, proj_labels) + lam * self._seg_loss(z4, proj_labels) + lam * self._seg_loss(z8, proj_labels))
+                else:
+                    pred, feats, pre_feats = out
+                    seg_loss = self._seg_loss(pred, proj_labels)
+
+                sep_loss = self.sep_lambda * self._sep_loss_from_feats(feats, pre_feats, proj_labels)
+                sep_loss_val = sep_loss.item()
+
+                self._compute_dfa_deltas(feats.detach(), proj_labels)
 
             seg_loss.backward()
+
+            delta_norm = sum(d.norm().item()**2 for d in self._delta.values())**0.5
+            grad_norm_backbone = sum(p.grad.norm().item()**2 for p in self.backbone_optimizer.param_groups[0]['params'] if p.grad is not None)**0.5
+            grad_norm_head = sum(p.grad.norm().item()**2 for p in self.head_optimizer.param_groups[0]['params'] if p.grad is not None)**0.5
+
+            if hasattr(self, 'stats_file'):
+                self.global_step += 1
+                self.stats_file.write(f"{self.global_step},{delta_norm:.4f},{grad_norm_backbone:.4f},{grad_norm_head:.4f}\n")
+                self.stats_file.flush()
 
             self.head_optimizer.step()
             self.backbone_optimizer.step()
             self.scheduler.step()
+            self.backbone_scheduler.step()
 
             self._delta.clear()
 
