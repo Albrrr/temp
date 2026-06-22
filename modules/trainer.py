@@ -109,7 +109,7 @@ class CNNTrainer:
                 pg['lr'] = lr
             if i == 0: break
 
-    def _train_epoch(self, loader, scaler, epoch):
+    def _train_epoch(self, loader, epoch):
         losses = AverageMeter()
         acc_m = AverageMeter()
         iou_m = AverageMeter()
