@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 from dataset.parser import Parser
 from modules.resnet import ResNet10, ResNet18, ResNet34, ResNet50, ResNet101, ResNet152, get_model
-from modules.separation_trainers import TeZOTrainer, DFATrainer
+from modules.margin_trainers import TeZOTrainer, DFATrainer
 from modules.trainer import CNNTrainer
 from modules.knowledge_distill import RKDDistiller
 from modules.hdc_model import HDCModel
@@ -23,9 +23,10 @@ STUDENTS_ONLY = False
 
 HD_DIM = 10000
 FEAT_DIM = 128
-TEACHER_FEATURE_EXTRACTOR_EPOCHS = 80
-STUDENT_FEATURE_EXTRACTOR_EPOCHS = 80
-HDC_RETRAIN_EPOCHS = 10
+FEATURE_EXTRACTOR_EPOCHS = 80
+DISTILLATION_EPOCHS = 80
+HDC_EPOCHS = 10
+MARGIN_EPOCHS = 80
 
 # Options for TEACHER_SIZE and STUDENT_SIZE:
 # - 'resnet10' : Very small model (often used for student)
@@ -46,6 +47,51 @@ def compute_proto_distances(protos):
     sim_matrix = norm_protos @ norm_protos.t()
     dist_matrix = 1 - sim_matrix
     return dist_matrix
+
+def train_3stage_pipeline(trainer_class, name, model_size, num_classes, loss_weights, device, train_loader, common_rp_weight):
+    print(f"\n--- Training {name} Teacher ({model_size}) ---")
+    
+    # Standard FE Training
+    print(f"  -> Standard FE Training for {name}")
+    fe_model = get_model(model_size, num_classes, aux=True)
+    fe_dir = f"logs/{name.lower()}_teacher_fe"
+    os.makedirs(fe_dir, exist_ok=True)
+    fe_trainer = CNNTrainer(num_classes=num_classes, loss_weights=loss_weights, log_dir=fe_dir, device=device, model=fe_model, aux_loss=True)
+    fe_trainer.train(train_loader, FEATURE_EXTRACTOR_EPOCHS)
+    
+    fe_ckpt_path = f"{fe_dir}/SENet"
+    torch.save({"state_dict": fe_trainer.model.state_dict()}, fe_ckpt_path)
+    
+    # HDC Training
+    print(f"  -> HDC Training for {name}")
+    hdc_model = HDCModel(num_classes, fe_ckpt_path, device, HD_DIM, model_type=model_size)
+    hdc_model.projection.weight.data = common_rp_weight.clone()
+    hdc_trainer = HDCTrainer(hdc_model, num_classes, device, retrain_epochs=HDC_EPOCHS)
+    hdc_trainer.train(train_loader)
+    hdc_model.sync_class_weights()
+    data_driven_protos = hdc_model.classify.weight.data.clone()
+    
+    # Margin FE Training
+    print(f"  -> Margin FE Training for {name}")
+    margin_model = get_model(model_size, num_classes, aux=True)
+    margin_model.load_state_dict(torch.load(fe_ckpt_path)["state_dict"])
+    
+    margin_dir = f"logs/{name.lower()}_teacher_margin"
+    os.makedirs(margin_dir, exist_ok=True)
+    margin_trainer = trainer_class(
+        num_classes=num_classes, loss_weights=loss_weights, hd_dim=HD_DIM, feat_dim=FEAT_DIM,
+        log_dir=margin_dir, device=device, steps_per_epoch=len(train_loader),
+        model=margin_model
+    )
+    margin_trainer.rp_weight = common_rp_weight
+    margin_trainer.set_class_protos(data_driven_protos)
+    margin_trainer.train(train_loader, MARGIN_EPOCHS)
+    
+    final_dir = f"logs/{name.lower()}_teacher"
+    os.makedirs(final_dir, exist_ok=True)
+    torch.save({"state_dict": margin_trainer.model.state_dict()}, f"{final_dir}/SENet")
+    
+    return margin_trainer.model
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -97,17 +143,7 @@ def main():
 
     if TRAIN_TEZO:
         if not STUDENTS_ONLY:
-            print(f"\n--- [Branch 1] Training TeZO Teacher ({TEACHER_SIZE}) ---")
-            tezo_model = get_model(TEACHER_SIZE, num_classes, aux=True)
-            tezo_trainer = TeZOTrainer(
-                num_classes=num_classes, loss_weights=loss_weights, hd_dim=HD_DIM, feat_dim=FEAT_DIM,
-                log_dir="logs/tezo_teacher", device=device, steps_per_epoch=len(train_loader),
-                model=tezo_model
-            )
-            tezo_trainer.rp_weight = common_rp_weight
-            tezo_trainer.set_class_protos(random_protos)
-            tezo_trainer.train(train_loader, TEACHER_FEATURE_EXTRACTOR_EPOCHS)
-            tezo_teacher_model = tezo_trainer.model
+            tezo_teacher_model = train_3stage_pipeline(TeZOTrainer, "TeZO", TEACHER_SIZE, num_classes, loss_weights, device, train_loader, common_rp_weight)
         else:
             print(f"\n--- [Branch 1] SKIPPED: TeZO Teacher Training (Loading Checkpoint) ---")
             tezo_teacher_model = get_model(TEACHER_SIZE, num_classes, aux=True)
@@ -121,24 +157,14 @@ def main():
         if not TEACHERS_ONLY:
             print(f"\n--- [Branch 1] Distilling TeZO Teacher -> Student ({STUDENT_SIZE}) ---")
             distiller_tezo = RKDDistiller(tezo_teacher_model, device)
-            tezo_student = distiller_tezo.distill(model_size=STUDENT_SIZE, dataloader=train_loader, epochs=STUDENT_FEATURE_EXTRACTOR_EPOCHS, num_classes=num_classes, graph_name="TeZO")
+            tezo_student = distiller_tezo.distill(model_size=STUDENT_SIZE, dataloader=train_loader, epochs=DISTILLATION_EPOCHS, num_classes=num_classes, graph_name="TeZO")
             torch.save({"state_dict": tezo_student.state_dict()}, "logs/tezo_student/SENet")
     else:
         print("\n--- [Branch 1] SKIPPED: TeZO Training & Distillation ---")
 
     if TRAIN_DFA:
         if not STUDENTS_ONLY:
-            print(f"\n--- [Branch 2] Training DFA Teacher ({TEACHER_SIZE}) ---")
-            dfa_model = get_model(TEACHER_SIZE, num_classes, aux=True)
-            dfa_trainer = DFATrainer(
-                num_classes=num_classes, loss_weights=loss_weights, hd_dim=HD_DIM, feat_dim=FEAT_DIM,
-                log_dir="logs/dfa_teacher", device=device, steps_per_epoch=len(train_loader),
-                model=dfa_model
-            )
-            dfa_trainer.rp_weight = common_rp_weight
-            dfa_trainer.set_class_protos(random_protos)
-            dfa_trainer.train(train_loader, TEACHER_FEATURE_EXTRACTOR_EPOCHS)
-            dfa_teacher_model = dfa_trainer.model
+            dfa_teacher_model = train_3stage_pipeline(DFATrainer, "DFA", TEACHER_SIZE, num_classes, loss_weights, device, train_loader, common_rp_weight)
         else:
             print(f"\n--- [Branch 2] SKIPPED: DFA Teacher Training (Loading Checkpoint) ---")
             dfa_teacher_model = get_model(TEACHER_SIZE, num_classes, aux=True)
@@ -152,7 +178,7 @@ def main():
         if not TEACHERS_ONLY:
             print(f"\n--- [Branch 2] Distilling DFA Teacher -> Student ({STUDENT_SIZE}) ---")
             distiller_dfa = RKDDistiller(dfa_teacher_model, device)
-            dfa_student = distiller_dfa.distill(model_size=STUDENT_SIZE, dataloader=train_loader, epochs=STUDENT_FEATURE_EXTRACTOR_EPOCHS, num_classes=num_classes, graph_name="DFA")
+            dfa_student = distiller_dfa.distill(model_size=STUDENT_SIZE, dataloader=train_loader, epochs=DISTILLATION_EPOCHS, num_classes=num_classes, graph_name="DFA")
             torch.save({"state_dict": dfa_student.state_dict()}, "logs/dfa_student/SENet")
     else:
         print("\n--- [Branch 2] SKIPPED: DFA Training & Distillation ---")
@@ -162,7 +188,7 @@ def main():
         baseline_model = get_model(STUDENT_SIZE, num_classes, aux=False)
             
         baseline_trainer = CNNTrainer(num_classes=num_classes, loss_weights=loss_weights, log_dir="logs/baseline", device=device, model=baseline_model, aux_loss=False)
-        baseline_trainer.train(train_loader, TEACHER_FEATURE_EXTRACTOR_EPOCHS)
+        baseline_trainer.train(train_loader, FEATURE_EXTRACTOR_EPOCHS)
 
         torch.save({"state_dict": baseline_trainer.model.state_dict()}, "logs/baseline/SENet")
     elif TRAIN_BASELINE and TEACHERS_ONLY:
@@ -183,7 +209,7 @@ def main():
         hdc_model = HDCModel(num_classes, path, device, HD_DIM, model_type=model_type)
         hdc_model.projection.weight.data = common_rp_weight.clone()
         
-        hdc_trainer = HDCTrainer(hdc_model, num_classes, device, retrain_epochs=HDC_RETRAIN_EPOCHS)
+        hdc_trainer = HDCTrainer(hdc_model, num_classes, device, retrain_epochs=HDC_EPOCHS)
         hdc_trainer.train(train_loader)
 
         independent_evaluator = iouEval(num_classes, device, ignore_idx)
