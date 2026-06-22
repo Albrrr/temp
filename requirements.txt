@@ -1,5 +1,5 @@
 torch
-torchhd
+torch-hd
 numpy
 scipy
 opencv-python
