@@ -27,7 +27,7 @@ class HDCModel(nn.Module):
         self.classify.weight.data.fill_(0.0)
 
         self.classify_weights = nn.Parameter(self.classify.weight.data.clone(), requires_grad=False)
-
+        self.to(device)
     def _extract_features(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.net(x, only_feat=True)
         feat = feat.permute(0, 2, 3, 1)
