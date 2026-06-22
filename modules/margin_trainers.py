@@ -320,7 +320,8 @@ class TeZOTrainer(_BaseHDTrainer):
 
             for n, p in self._backbone_params:
                 p.data.add_(zs[n], alpha=eps)
-            loss_pos = self._zo_loss(in_vol, proj_labels)
+            with torch.amp.autocast('cuda'):
+                loss_pos = self._zo_loss(in_vol, proj_labels)
 
             for n, p in self._backbone_params:
                 p.data.add_(zs[n], alpha=-2 * eps)
@@ -385,10 +386,12 @@ class TeZOTrainer(_BaseHDTrainer):
             self._zo_step(in_vol, proj_labels)
 
             self.head_optimizer.zero_grad()
-            seg_loss, pred = self._full_seg_loss(in_vol, proj_labels)
+            with torch.amp.autocast('cuda'):
+                seg_loss, pred = self._full_seg_loss(in_vol, proj_labels)
 
-            seg_loss.backward()
-            self.head_optimizer.step()
+            self.scaler.scale(seg_loss).backward()
+            self.scaler.step(self.head_optimizer)
+            self.scaler.update()
             self.scheduler.step()
 
             with torch.no_grad():
@@ -493,7 +496,7 @@ class DFATrainer(_BaseHDTrainer):
         for name, shape in shapes.items():
             C_l = shape[1] 
             B_l = torch.randn(self.hd_dim, C_l, device=self.device) / math.sqrt(self.hd_dim)
-            self._feedback[name] = B_l 
+            self._feedback[name] = B_l.half() 
 
             module = dict(net.named_modules())[name]
             self._hooks.append(module.register_forward_hook(self._make_tensor_injection_hook(name)))
@@ -509,7 +512,8 @@ class DFATrainer(_BaseHDTrainer):
                 delta = self._delta[name].to(grad.dtype)
                 if delta.shape[2:] != grad.shape[2:]:
                     delta = F.interpolate(delta, size=grad.shape[2:], mode='bilinear', align_corners=False)
-                return grad + delta
+                scale = self.scaler.get_scale() if hasattr(self, 'scaler') else 1.0
+                return grad + (delta.to(grad.dtype) * scale)
             
             out.register_hook(tensor_backward_hook)
         return forward_hook
@@ -545,7 +549,7 @@ class DFATrainer(_BaseHDTrainer):
             e = F.normalize(s, dim=1) - proto_true
 
         for name, B_l in self._feedback.items():
-            delta_flat = e @ B_l
+            delta_flat = e @ B_l.float()
             C_l = delta_flat.shape[1]
 
             delta_full = torch.zeros(B * H * W, C_l, device=self.device, dtype=delta_flat.dtype)
@@ -572,22 +576,26 @@ class DFATrainer(_BaseHDTrainer):
             self.head_optimizer.zero_grad()
             self.backbone_optimizer.zero_grad()
 
-            out = net(in_vol, return_feat=True, return_pre_feat=True)
-            if self.aux_loss:
-                pred, aux, feats, pre_feats = out
-                z2, z4, z8 = aux
-                lam = self.aux_lambda
-                seg_loss = (self._seg_loss(pred, proj_labels) + lam * self._seg_loss(z2, proj_labels) + lam * self._seg_loss(z4, proj_labels) + lam * self._seg_loss(z8, proj_labels))
-            else:
-                pred, feats, pre_feats = out
-                seg_loss = self._seg_loss(pred, proj_labels)
+            with torch.amp.autocast('cuda'):
+                out = net(in_vol, return_feat=True, return_pre_feat=True)
+                if self.aux_loss:
+                    pred, aux, feats, pre_feats = out
+                    z2, z4, z8 = aux
+                    lam = self.aux_lambda
+                    seg_loss = (self._seg_loss(pred, proj_labels) + lam * self._seg_loss(z2, proj_labels) + lam * self._seg_loss(z4, proj_labels) + lam * self._seg_loss(z8, proj_labels))
+                else:
+                    pred, feats, pre_feats = out
+                    seg_loss = self._seg_loss(pred, proj_labels)
 
-            margin_loss = self.margin_lambda * self._margin_loss_from_feats(feats, pre_feats, proj_labels)
-            margin_loss_val = margin_loss.item()
+                margin_loss = self.margin_lambda * self._margin_loss_from_feats(feats, pre_feats, proj_labels)
+                margin_loss_val = margin_loss.item()
 
-            self._compute_dfa_deltas(feats.detach(), proj_labels)
+                self._compute_dfa_deltas(feats.detach(), proj_labels)
 
-            seg_loss.backward()
+            self.scaler.scale(seg_loss).backward()
+
+            self.scaler.unscale_(self.head_optimizer)
+            self.scaler.unscale_(self.backbone_optimizer)
 
             delta_norm = sum(d.norm().item()**2 for d in self._delta.values())**0.5
             grad_norm_backbone = sum(p.grad.norm().item()**2 for p in self.backbone_optimizer.param_groups[0]['params'] if p.grad is not None)**0.5
@@ -598,8 +606,9 @@ class DFATrainer(_BaseHDTrainer):
                 self.stats_file.write(f"{self.global_step},{delta_norm:.4f},{grad_norm_backbone:.4f},{grad_norm_head:.4f}\n")
                 self.stats_file.flush()
 
-            self.head_optimizer.step()
-            self.backbone_optimizer.step()
+            self.scaler.step(self.head_optimizer)
+            self.scaler.step(self.backbone_optimizer)
+            self.scaler.update()
 
             self.scheduler.step()
             self.backbone_scheduler.step()

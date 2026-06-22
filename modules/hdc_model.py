@@ -28,8 +28,10 @@ class HDCModel(nn.Module):
 
         self.classify_weights = nn.Parameter(self.classify.weight.data.clone(), requires_grad=False)
         self.to(device)
+
     def _extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        feat = self.net(x, only_feat=True)
+        with torch.amp.autocast('cuda', enabled=True):
+            feat = self.net(x, only_feat=True)
         feat = feat.permute(0, 2, 3, 1)
         return feat.reshape(-1, self.feat_dim)
 

@@ -73,12 +73,13 @@ class CNNTrainer:
         self.evaluator = iouEval(num_classes, device, ignore_idx)
 
     def train(self, train_loader, num_epochs: int):
+        scaler = torch.amp.GradScaler('cuda')
         epoch_losses = []
         for epoch in range(num_epochs):
             if epoch == 0:
                 self._warmup_lr(train_loader)
             
-            acc, iou, loss = self._train_epoch(train_loader, epoch)
+            acc, iou, loss = self._train_epoch(train_loader, scaler, epoch)
             print(f"[Epoch {epoch+1}/{num_epochs}] loss={loss:.4f} acc={acc:.4f} iou={iou:.4f}")
             
             state = {
@@ -109,7 +110,7 @@ class CNNTrainer:
                 pg['lr'] = lr
             if i == 0: break
 
-    def _train_epoch(self, loader, epoch):
+    def _train_epoch(self, loader, scaler, epoch):
         losses = AverageMeter()
         acc_m = AverageMeter()
         iou_m = AverageMeter()
@@ -125,18 +126,20 @@ class CNNTrainer:
                 for pg in self.optimizer.param_groups:
                     pg['lr'] = lr
 
-            out = self.model(in_vol)
-            if self.aux_loss:
-                pred, (z2, z4, z8) = out
-                lam = self.aux_lambda
-                loss = (self._seg_loss(pred, proj_labels) + lam * self._seg_loss(z2, proj_labels) + lam * self._seg_loss(z4, proj_labels) + lam * self._seg_loss(z8, proj_labels))
-            else:
-                pred = out
-                loss = self._seg_loss(pred, proj_labels)
+            with torch.amp.autocast('cuda'):
+                out = self.model(in_vol)
+                if self.aux_loss:
+                    pred, (z2, z4, z8) = out
+                    lam = self.aux_lambda
+                    loss = (self._seg_loss(pred, proj_labels) + lam * self._seg_loss(z2, proj_labels) + lam * self._seg_loss(z4, proj_labels) + lam * self._seg_loss(z8, proj_labels))
+                else:
+                    pred = out
+                    loss = self._seg_loss(pred, proj_labels)
 
             self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(self.optimizer)
+            scaler.update()
 
             with torch.no_grad():
                 self.evaluator.addBatch(pred.argmax(1), proj_labels)
