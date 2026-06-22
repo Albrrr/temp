@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchhd import embeddings, functional
 
-from modules.resnet import ResNet10, ResNet18, ResNet34
+from modules.resnet import get_model
 
 class HDCModel(nn.Module):
     def __init__(self, num_classes: int, model_path: str, device: torch.device, hd_dim: int = 10000, model_type: str = "resnet34"):
@@ -13,15 +13,10 @@ class HDCModel(nn.Module):
         self.hd_dim = hd_dim
         self.feat_dim = 128 
 
-        if model_type == "resnet10":
-            self.net = ResNet10(num_classes, aux=False)
-        elif model_type == "resnet18":
-            self.net = ResNet18(num_classes, aux=False)
-        else:
-            self.net = ResNet34(num_classes, aux=False)
+        self.net = get_model(model_type, num_classes, aux=True)
 
         ckpt = torch.load(model_path, map_location="cpu")
-        self.net.load_state_dict(ckpt["state_dict"], strict=True)
+        self.net.load_state_dict(ckpt["state_dict"], strict=False)
         self.net.eval()
         for p in self.net.parameters():
             p.requires_grad_(False)
@@ -34,8 +29,7 @@ class HDCModel(nn.Module):
         self.classify_weights = nn.Parameter(self.classify.weight.data.clone(), requires_grad=False)
 
     def _extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        with torch.cuda.amp.autocast(enabled=True):
-            feat = self.net(x, only_feat=True)
+        feat = self.net(x, only_feat=True)
         feat = feat.permute(0, 2, 3, 1)
         return feat.reshape(-1, self.feat_dim)
 
