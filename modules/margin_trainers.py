@@ -654,6 +654,8 @@ class EndToEndHDTrainer(_BaseHDTrainer):
             self.optimizer, T_max=self.steps_per_epoch * num_epochs
         )
         self.scaler = torch.amp.GradScaler('cuda')
+
+    def _train_epoch(self, loader, epoch, total_epochs):
         seg_m = AverageMeter()
         margin_m = AverageMeter()
         acc_m = AverageMeter()
