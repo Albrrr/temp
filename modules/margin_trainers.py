@@ -630,3 +630,69 @@ class DFATrainer(_BaseHDTrainer):
             self.stats_file.close()
         for h in getattr(self, '_hooks', []):
             h.remove()
+
+class EndToEndHDTrainer(_BaseHDTrainer):
+    """
+    Trains the backbone and HD class prototypes jointly using exact backprop.
+    """
+    def __init__(self, num_classes: int, loss_weights: torch.Tensor, hd_dim: int, feat_dim: int = 128, log_dir: str = "logs", device: torch.device = torch.device("cpu"), **base_kwargs):
+        super().__init__(num_classes, loss_weights, hd_dim, feat_dim, log_dir, device, **base_kwargs)
+        
+        self.class_protos = nn.Parameter(torch.randn(num_classes, hd_dim, device=device))
+        
+        self.optimizer = optim.SGD(
+            [
+                {"params": self.model.parameters()},
+                {"params": self.class_protos, "lr": 0.05}
+            ],
+            lr=0.01,
+            momentum=0.9,
+            weight_decay=1e-4
+        )
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.steps_per_epoch * 80)
+
+    def _train_epoch(self, loader, epoch, total_epochs):
+        seg_m = AverageMeter()
+        margin_m = AverageMeter()
+        acc_m = AverageMeter()
+        iou_m = AverageMeter()
+        self.model.train()
+
+        net = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+
+        for in_vol, _, proj_labels, *_ in tqdm(loader, desc=f"[E2E] Train {epoch+1}/{total_epochs}"):
+            in_vol = in_vol.to(self.device)
+            proj_labels = proj_labels.to(self.device).long()
+            N = in_vol.size(0)
+
+            self.optimizer.zero_grad()
+
+            with torch.amp.autocast('cuda'):
+                out = net(in_vol, return_feat=True, return_pre_feat=True)
+                if self.aux_loss:
+                    pred, aux, feats, pre_feats = out
+                    z2, z4, z8 = aux
+                    lam = self.aux_lambda
+                    seg_loss = (self._seg_loss(pred, proj_labels) + lam * self._seg_loss(z2, proj_labels) + lam * self._seg_loss(z4, proj_labels) + lam * self._seg_loss(z8, proj_labels))
+                else:
+                    pred, feats, pre_feats = out
+                    seg_loss = self._seg_loss(pred, proj_labels)
+
+                margin_loss = self.margin_lambda * self._margin_loss_from_feats(feats, pre_feats, proj_labels)
+                total_loss = seg_loss + margin_loss
+
+            self.scaler.scale(total_loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            self.scheduler.step()
+
+            with torch.no_grad():
+                acc, jac = self._eval_metrics(pred, proj_labels)
+
+            seg_m.update(seg_loss.item(), N)
+            margin_m.update(margin_loss.item(), N)
+            acc_m.update(acc.item(), N)
+            iou_m.update(jac.item(), N)
+
+        return acc_m.avg, iou_m.avg, seg_m.avg, margin_m.avg

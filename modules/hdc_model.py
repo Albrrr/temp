@@ -27,7 +27,6 @@ class HDCModel(nn.Module):
         self.classify.weight.data.fill_(0.0)
 
         self.classify_weights = nn.Parameter(self.classify.weight.data.clone(), requires_grad=False)
-        self.to(device)
 
     def _extract_features(self, x: torch.Tensor) -> torch.Tensor:
         with torch.amp.autocast('cuda', enabled=True):

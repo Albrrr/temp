@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 from dataset.parser import Parser
 from modules.resnet import ResNet10, ResNet18, ResNet34, ResNet50, ResNet101, ResNet152, get_model
-from modules.margin_trainers import TeZOTrainer, DFATrainer
+from modules.margin_trainers import TeZOTrainer, DFATrainer, EndToEndHDTrainer
 from modules.trainer import CNNTrainer
 from modules.knowledge_distill import RKDDistiller
 from modules.hdc_model import HDCModel
@@ -14,22 +14,16 @@ from modules.hdc_trainer import HDCTrainer
 from modules.ioueval import iouEval
 from torchhd import embeddings
 
-TRAIN_TEZO = True
-TRAIN_DFA = True
-TRAIN_BASELINE = True
+TRAIN_E2E = True
+TRAIN_STUDENT = False
 
-FEATURE_EXTRACTOR_BATCH_SIZE = 32
-HDC_BATCH_SIZE = 6
-
-TEACHERS_ONLY = True
-STUDENTS_ONLY = False
+BATCH_SIZE = 32
 
 HD_DIM = 10000
 FEAT_DIM = 128
-FEATURE_EXTRACTOR_EPOCHS = 80
+TEACHER_EPOCHS = 80
 DISTILLATION_EPOCHS = 80
-HDC_EPOCHS = 10
-MARGIN_EPOCHS = 80
+HDC_EPOCHS = 10 # still used for final HDC evaluation of the students
 
 # Options for TEACHER_SIZE and STUDENT_SIZE:
 # - 'resnet10' : Very small model (often used for student)
@@ -51,50 +45,28 @@ def compute_proto_distances(protos):
     dist_matrix = 1 - sim_matrix
     return dist_matrix
 
-def train_3stage_pipeline(trainer_class, name, model_size, num_classes, loss_weights, device, train_loader, common_rp_weight):
-    print(f"\n--- Training {name} Teacher ({model_size}) ---")
+def train_e2e_pipeline(name, model_size, num_classes, loss_weights, device, train_loader, common_rp_weight):
+    print(f"\n--- Training {name} Teacher E2E ({model_size}) ---")
     
-    # Standard FE Training
-    print(f"  -> Standard FE Training for {name}")
-    fe_model = get_model(model_size, num_classes, aux=True)
-    fe_dir = f"logs/{name.lower()}_teacher_fe"
-    os.makedirs(fe_dir, exist_ok=True)
-    fe_trainer = CNNTrainer(num_classes=num_classes, loss_weights=loss_weights, log_dir=fe_dir, device=device, model=fe_model, aux_loss=True)
-    fe_trainer.train(train_loader, FEATURE_EXTRACTOR_EPOCHS)
+    model = get_model(model_size, num_classes, aux=True)
     
-    fe_ckpt_path = f"{fe_dir}/SENet"
-    torch.save({"state_dict": fe_trainer.model.state_dict()}, fe_ckpt_path)
+    log_dir = f"logs/{name.lower()}_teacher_e2e"
+    os.makedirs(log_dir, exist_ok=True)
     
-    # HDC Training
-    print(f"  -> HDC Training for {name}")
-    hdc_model = HDCModel(num_classes, fe_ckpt_path, device, HD_DIM, model_type=model_size)
-    hdc_model.projection.weight.data = common_rp_weight.clone()
-    hdc_trainer = HDCTrainer(hdc_model, num_classes, device, retrain_epochs=HDC_EPOCHS)
-    hdc_trainer.train(train_loader)
-    hdc_model.sync_class_weights()
-    data_driven_protos = hdc_model.classify.weight.data.clone()
-    
-    # Margin FE Training
-    print(f"  -> Margin FE Training for {name}")
-    margin_model = get_model(model_size, num_classes, aux=True)
-    margin_model.load_state_dict(torch.load(fe_ckpt_path)["state_dict"])
-    
-    margin_dir = f"logs/{name.lower()}_teacher_margin"
-    os.makedirs(margin_dir, exist_ok=True)
-    margin_trainer = trainer_class(
+    trainer = EndToEndHDTrainer(
         num_classes=num_classes, loss_weights=loss_weights, hd_dim=HD_DIM, feat_dim=FEAT_DIM,
-        log_dir=margin_dir, device=device, steps_per_epoch=len(train_loader),
-        model=margin_model
+        log_dir=log_dir, device=device, steps_per_epoch=len(train_loader),
+        model=model
     )
-    margin_trainer.rp_weight = common_rp_weight
-    margin_trainer.set_class_protos(data_driven_protos)
-    margin_trainer.train(train_loader, MARGIN_EPOCHS)
+    trainer.rp_weight = common_rp_weight.to(device)
+    
+    trainer.train(train_loader, 80) # 80 total epochs
     
     final_dir = f"logs/{name.lower()}_teacher"
     os.makedirs(final_dir, exist_ok=True)
-    torch.save({"state_dict": margin_trainer.model.state_dict()}, f"{final_dir}/SENet")
+    torch.save({"state_dict": trainer.model.state_dict()}, f"{final_dir}/SENet")
     
-    return margin_trainer.model
+    return trainer.model
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -107,21 +79,28 @@ def main():
     if not os.path.exists(data_root):
         print(f"WARNING: Data root '{data_root}' not found. Please ensure the dataset is in the correct path.")
 
-    parser = Parser(
-        root=data_root,
-        train_sequences=data_cfg['split']['train'],
-        valid_sequences=data_cfg['split']['valid'],
-        labels=data_cfg['labels'],
-        color_map=data_cfg['color_map'],
-        learning_map=data_cfg['learning_map'],
-        learning_map_inv=data_cfg['learning_map_inv'],
-        sensor=arch_cfg['dataset']['sensor'],
-        max_points=arch_cfg['dataset']['max_points'],
-        batch_size=batch_size,
-        workers=arch_cfg['train']['workers']
-    )
+    def create_parser(bs):
+        return Parser(
+            root=data_root,
+            train_sequences=data_cfg['split']['train'],
+            valid_sequences=data_cfg['split']['valid'],
+            labels=data_cfg['labels'],
+            color_map=data_cfg['color_map'],
+            learning_map=data_cfg['learning_map'],
+            learning_map_inv=data_cfg['learning_map_inv'],
+            sensor=arch_cfg['dataset']['sensor'],
+            max_points=arch_cfg['dataset']['max_points'],
+            batch_size=bs,
+            workers=arch_cfg['train']['workers']
+        )
+
+    parser = create_parser(batch_size)
+    parser_fe = create_parser(BATCH_SIZE)
+    parser_hdc = create_parser(BATCH_SIZE)
     
     train_loader = parser.get_train_set()
+    train_loader_fe = parser_fe.get_train_set()
+    train_loader_hdc = parser_hdc.get_train_set()
     val_loader = parser.get_valid_set()
 
     content = torch.zeros(num_classes)
@@ -140,67 +119,39 @@ def main():
     random_protos = torch.randn(num_classes, HD_DIM, device=device)
     random_protos = F.normalize(random_protos, dim=1)
 
-    os.makedirs("logs/tezo_student", exist_ok=True)
-    os.makedirs("logs/dfa_student", exist_ok=True)
-    os.makedirs("logs/baseline", exist_ok=True)
+    if TRAIN_E2E:
+        teacher_model = train_e2e_pipeline("E2E", TEACHER_SIZE, num_classes, loss_weights, device, train_loader_fe, common_rp_weight)
+    else:
+        print("\n--- SKIPPED: E2E Teacher Training ---")
 
-    if TRAIN_TEZO:
-        if not STUDENTS_ONLY:
-            tezo_teacher_model = train_3stage_pipeline(TeZOTrainer, "TeZO", TEACHER_SIZE, num_classes, loss_weights, device, train_loader, common_rp_weight)
-        else:
-            print(f"\n--- [Branch 1] SKIPPED: TeZO Teacher Training (Loading Checkpoint) ---")
-            tezo_teacher_model = get_model(TEACHER_SIZE, num_classes, aux=True)
-            ckpt_path = "logs/tezo_teacher/SENet"
+    if TRAIN_STUDENT:
+        os.makedirs("logs/e2e_student", exist_ok=True)
+        os.makedirs("logs/baseline", exist_ok=True)
+        
+        if not TRAIN_E2E:
+            print(f"\n--- Loading E2E Teacher Checkpoint ---")
+            teacher_model = get_model(TEACHER_SIZE, num_classes, aux=True)
+            ckpt_path = "logs/e2e_teacher/SENet"
             if os.path.exists(ckpt_path):
-                tezo_teacher_model.load_state_dict(torch.load(ckpt_path)["state_dict"])
+                teacher_model.load_state_dict(torch.load(ckpt_path)["state_dict"])
             else:
                 print(f"[WARNING] Teacher checkpoint not found at {ckpt_path}")
-            tezo_teacher_model.to(device)
+            teacher_model.to(device)
 
-        if not TEACHERS_ONLY:
-            print(f"\n--- [Branch 1] Distilling TeZO Teacher -> Student ({STUDENT_SIZE}) ---")
-            distiller_tezo = RKDDistiller(tezo_teacher_model, device)
-            tezo_student = distiller_tezo.distill(model_size=STUDENT_SIZE, dataloader=train_loader, epochs=DISTILLATION_EPOCHS, num_classes=num_classes, graph_name="TeZO")
-            torch.save({"state_dict": tezo_student.state_dict()}, "logs/tezo_student/SENet")
-    else:
-        print("\n--- [Branch 1] SKIPPED: TeZO Training & Distillation ---")
+        print(f"\n--- Distilling E2E Teacher -> Student ({STUDENT_SIZE}) ---")
+        distiller = RKDDistiller(teacher_model, device)
+        e2e_student = distiller.distill(model_size=STUDENT_SIZE, dataloader=train_loader, epochs=DISTILLATION_EPOCHS, num_classes=num_classes, graph_name="E2E")
+        torch.save({"state_dict": e2e_student.state_dict()}, "logs/e2e_student/SENet")
 
-    if TRAIN_DFA:
-        if not STUDENTS_ONLY:
-            dfa_teacher_model = train_3stage_pipeline(DFATrainer, "DFA", TEACHER_SIZE, num_classes, loss_weights, device, train_loader, common_rp_weight)
-        else:
-            print(f"\n--- [Branch 2] SKIPPED: DFA Teacher Training (Loading Checkpoint) ---")
-            dfa_teacher_model = get_model(TEACHER_SIZE, num_classes, aux=True)
-            ckpt_path = "logs/dfa_teacher/SENet"
-            if os.path.exists(ckpt_path):
-                dfa_teacher_model.load_state_dict(torch.load(ckpt_path)["state_dict"])
-            else:
-                print(f"[WARNING] Teacher checkpoint not found at {ckpt_path}")
-            dfa_teacher_model.to(device)
-
-        if not TEACHERS_ONLY:
-            print(f"\n--- [Branch 2] Distilling DFA Teacher -> Student ({STUDENT_SIZE}) ---")
-            distiller_dfa = RKDDistiller(dfa_teacher_model, device)
-            dfa_student = distiller_dfa.distill(model_size=STUDENT_SIZE, dataloader=train_loader, epochs=DISTILLATION_EPOCHS, num_classes=num_classes, graph_name="DFA")
-            torch.save({"state_dict": dfa_student.state_dict()}, "logs/dfa_student/SENet")
-    else:
-        print("\n--- [Branch 2] SKIPPED: DFA Training & Distillation ---")
-
-    if TRAIN_BASELINE and not TEACHERS_ONLY:
-        print(f"\n--- [Branch 3] Training Baseline Student ({STUDENT_SIZE}) ---")
+        print(f"\n--- Training Baseline Student ({STUDENT_SIZE}) ---")
         baseline_model = get_model(STUDENT_SIZE, num_classes, aux=False)
             
         baseline_trainer = CNNTrainer(num_classes=num_classes, loss_weights=loss_weights, log_dir="logs/baseline", device=device, model=baseline_model, aux_loss=False)
-        baseline_trainer.train(train_loader, FEATURE_EXTRACTOR_EPOCHS)
-
+        baseline_trainer.train(train_loader_fe, TEACHER_EPOCHS)
         torch.save({"state_dict": baseline_trainer.model.state_dict()}, "logs/baseline/SENet")
-    elif TRAIN_BASELINE and TEACHERS_ONLY:
-        print("\n--- [Branch 3] SKIPPED: Baseline Training (TEACHERS_ONLY is True) ---")
     else:
-        print("\n--- [Branch 3] SKIPPED: Baseline Training ---")
-
-    if TEACHERS_ONLY:
-        print("\n--- Evaluation SKIPPED: TEACHERS_ONLY is True ---")
+        print("\n--- SKIPPED: Student Distillation & Baseline Training ---")
+        print("\n--- Evaluation SKIPPED: TRAIN_STUDENT is False ---")
         return
 
     def eval_hdc(path, model_type, name):
@@ -213,7 +164,7 @@ def main():
         hdc_model.projection.weight.data = common_rp_weight.clone()
         
         hdc_trainer = HDCTrainer(hdc_model, num_classes, device, retrain_epochs=HDC_EPOCHS)
-        hdc_trainer.train(train_loader)
+        hdc_trainer.train(train_loader_hdc)
 
         independent_evaluator = iouEval(num_classes, device, ignore_idx)
         acc = hdc_trainer.validate(val_loader, independent_evaluator)
@@ -233,28 +184,25 @@ def main():
     results.append(f"{'Model Strategy':<25} | {'Val mIoU':<10} | {'Avg Proto Dist':<15}")
     results.append("-" * 95)
 
-    dist_tezo = compute_proto_distances(protos_tezo) if protos_tezo is not None else None
-    dist_dfa = compute_proto_distances(protos_dfa) if protos_dfa is not None else None
+    dist_e2e = compute_proto_distances(protos_e2e) if protos_e2e is not None else None
     dist_base = compute_proto_distances(protos_base) if protos_base is not None else None
 
-    if acc_tezo is not None: results.append(f"{'TeZO -> Distill':<25} | {acc_tezo:<10.4f} | {dist_tezo.mean():<15.4f}")
-    if acc_dfa is not None:  results.append(f"{'DFA -> Distill':<25} | {acc_dfa:<10.4f} | {dist_dfa.mean():<15.4f}")
+    if acc_e2e is not None: results.append(f"{'E2E -> Distill':<25} | {acc_e2e:<10.4f} | {dist_e2e.mean():<15.4f}")
     if acc_base is not None: results.append(f"{'Baseline (Standard)':<25} | {acc_base:<10.4f} | {dist_base.mean():<15.4f}")
     
     results.append("-" * 95)
     results.append("\nPairwise Distance Comparison:")
-    header = f"{'Classes':<10} | {'TeZO-Dist':<10} | {'DFA-Dist':<10} | {'Baseline':<10} | {'T-B Diff':<10}"
+    header = f"{'Classes':<10} | {'E2E-Dist':<10} | {'Baseline':<10} | {'E-B Diff':<10}"
     results.append(header)
     results.append("-" * len(header))
     
     for i in range(num_classes):
         for j in range(i + 1, num_classes):
-            dt = dist_tezo[i, j].item() if dist_tezo is not None else float('nan')
-            dd = dist_dfa[i, j].item() if dist_dfa is not None else float('nan')
+            de = dist_e2e[i, j].item() if dist_e2e is not None else float('nan')
             db = dist_base[i, j].item() if dist_base is not None else float('nan')
             
-            diff = (dt - db) if (dist_tezo is not None and dist_base is not None) else float('nan')
-            results.append(f"{i:02d} vs {j:02d}:   | {dt:<10.4f} | {dd:<10.4f} | {db:<10.4f} | {diff:<10.4f}")
+            diff = (de - db) if (dist_e2e is not None and dist_base is not None) else float('nan')
+            results.append(f"{i:02d} vs {j:02d}:   | {de:<10.4f} | {db:<10.4f} | {diff:<10.4f}")
             
     final_output = "\n".join(results)
     print(final_output)
