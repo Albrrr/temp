@@ -116,6 +116,7 @@ class _BaseHDTrainer:
         self.margin_max_pixels = margin_max_pixels
         self.ignore_index = ignore_index
         self.decov_weight = decov_weight
+        self.steps_per_epoch = steps_per_epoch
 
         ignore_idx = (loss_weights < 1e-10).nonzero(as_tuple=True)[0].tolist()
 
@@ -143,7 +144,7 @@ class _BaseHDTrainer:
         self.scheduler = WarmupExpDecayLR(self.optimizer, lr, warmup_steps, final_decay)
 
         self.evaluator = iouEval(num_classes, device, ignore_idx)
-        
+        self.scaler = torch.amp.GradScaler('cuda')
 
     def set_class_protos(self, protos: torch.Tensor):
         """
@@ -635,7 +636,7 @@ class EndToEndHDTrainer(_BaseHDTrainer):
     """
     Trains the backbone and HD class prototypes jointly using exact backprop.
     """
-    def __init__(self, num_classes: int, loss_weights: torch.Tensor, hd_dim: int, feat_dim: int = 128, log_dir: str = "logs", device: torch.device = torch.device("cpu"), **base_kwargs):
+    def __init__(self, num_classes: int, loss_weights: torch.Tensor, hd_dim: int, feat_dim: int = 128, log_dir: str = "logs", device: torch.device = torch.device("cpu"), num_epochs: int = 80, **base_kwargs):
         super().__init__(num_classes, loss_weights, hd_dim, feat_dim, log_dir, device, **base_kwargs)
         
         self.class_protos = nn.Parameter(torch.randn(num_classes, hd_dim, device=device))
@@ -649,9 +650,10 @@ class EndToEndHDTrainer(_BaseHDTrainer):
             momentum=0.9,
             weight_decay=1e-4
         )
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.steps_per_epoch * 80)
-
-    def _train_epoch(self, loader, epoch, total_epochs):
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=self.steps_per_epoch * num_epochs
+        )
+        self.scaler = torch.amp.GradScaler('cuda')
         seg_m = AverageMeter()
         margin_m = AverageMeter()
         acc_m = AverageMeter()

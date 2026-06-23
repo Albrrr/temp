@@ -22,6 +22,7 @@ BATCH_SIZE = 32
 HD_DIM = 10000
 FEAT_DIM = 128
 TEACHER_EPOCHS = 80
+STUDENT_EPOCHS = 80
 DISTILLATION_EPOCHS = 80
 HDC_EPOCHS = 10 # still used for final HDC evaluation of the students
 
@@ -45,7 +46,7 @@ def compute_proto_distances(protos):
     dist_matrix = 1 - sim_matrix
     return dist_matrix
 
-def train_e2e_pipeline(name, model_size, num_classes, loss_weights, device, train_loader, common_rp_weight):
+def train_e2e_pipeline(name, model_size, num_classes, loss_weights, device, train_loader, common_rp_weight, num_epochs=TEACHER_EPOCHS):
     print(f"\n--- Training {name} Teacher E2E ({model_size}) ---")
     
     model = get_model(model_size, num_classes, aux=True)
@@ -56,11 +57,11 @@ def train_e2e_pipeline(name, model_size, num_classes, loss_weights, device, trai
     trainer = EndToEndHDTrainer(
         num_classes=num_classes, loss_weights=loss_weights, hd_dim=HD_DIM, feat_dim=FEAT_DIM,
         log_dir=log_dir, device=device, steps_per_epoch=len(train_loader),
-        model=model
+        num_epochs=num_epochs, model=model
     )
     trainer.rp_weight = common_rp_weight.to(device)
     
-    trainer.train(train_loader, 80) # 80 total epochs
+    trainer.train(train_loader, num_epochs)
     
     final_dir = f"logs/{name.lower()}_teacher"
     os.makedirs(final_dir, exist_ok=True)
@@ -147,7 +148,7 @@ def main():
         baseline_model = get_model(STUDENT_SIZE, num_classes, aux=False)
             
         baseline_trainer = CNNTrainer(num_classes=num_classes, loss_weights=loss_weights, log_dir="logs/baseline", device=device, model=baseline_model, aux_loss=False)
-        baseline_trainer.train(train_loader_fe, TEACHER_EPOCHS)
+        baseline_trainer.train(train_loader_fe, STUDENT_EPOCHS)
         torch.save({"state_dict": baseline_trainer.model.state_dict()}, "logs/baseline/SENet")
     else:
         print("\n--- SKIPPED: Student Distillation & Baseline Training ---")
@@ -173,8 +174,7 @@ def main():
         protos = hdc_model.classify.weight.data.clone()
         return acc, protos
 
-    acc_tezo, protos_tezo = eval_hdc("logs/tezo_student/SENet", STUDENT_SIZE, "TeZO-Distilled")
-    acc_dfa, protos_dfa = eval_hdc("logs/dfa_student/SENet", STUDENT_SIZE, "DFA-Distilled")
+    acc_e2e, protos_e2e = eval_hdc("logs/e2e_student/SENet", STUDENT_SIZE, "E2E-Distilled")
     acc_base, protos_base = eval_hdc("logs/baseline/SENet", STUDENT_SIZE, "Baseline")
 
     results = []
