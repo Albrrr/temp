@@ -116,6 +116,7 @@ class _BaseHDTrainer:
         self.margin_max_pixels = margin_max_pixels
         self.ignore_index = ignore_index
         self.decov_weight = decov_weight
+        self.steps_per_epoch = steps_per_epoch
 
         ignore_idx = (loss_weights < 1e-10).nonzero(as_tuple=True)[0].tolist()
 
