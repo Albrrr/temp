@@ -151,3 +151,40 @@ class ArcFaceLoss(nn.Module):
         
         loss = F.cross_entropy(output, labels)
         return loss
+class CircleLoss(nn.Module):
+    def __init__(self, m=0.25, gamma=256):
+        super(CircleLoss, self).__init__()
+        self.m = m
+        self.gamma = gamma
+        self.soft_plus = nn.Softplus()
+
+    def forward(self, embeddings, labels):
+        sim_mat = torch.matmul(embeddings, embeddings.t())
+        
+        label_mat = labels.unsqueeze(0) == labels.unsqueeze(1)
+        eye = torch.eye(labels.size(0), dtype=torch.bool, device=labels.device)
+        pos_mask = label_mat & ~eye
+        neg_mask = ~label_mat
+
+        ap = torch.clamp_min(-sim_mat.detach() + 1 + self.m, min=0.)
+        an = torch.clamp_min(sim_mat.detach() + self.m, min=0.)
+
+        delta_p = 1 - self.m
+        delta_n = self.m
+
+        logit_p = -ap * (sim_mat - delta_p) * self.gamma
+        logit_n = an * (sim_mat - delta_n) * self.gamma
+
+        logit_p = logit_p.masked_fill(~pos_mask, float('-inf'))
+        logit_n = logit_n.masked_fill(~neg_mask, float('-inf'))
+
+        lse_p = torch.logsumexp(logit_p, dim=1)
+        lse_n = torch.logsumexp(logit_n, dim=1)
+
+        loss = self.soft_plus(lse_p + lse_n)
+        
+        valid = (pos_mask.sum(1) > 0) & (neg_mask.sum(1) > 0)
+        if valid.sum() > 0:
+            return loss[valid].mean()
+        else:
+            return torch.tensor(0.0, device=embeddings.device, requires_grad=True)

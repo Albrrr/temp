@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 from dataset.parser import Parser
 from modules.resnet import ResNet10, ResNet18, ResNet34, ResNet50, ResNet101, ResNet152, get_model
-from modules.margin_trainers import TeZOTrainer, DFATrainer, EndToEndHDTrainer
+from modules.margin_trainers import TeZOTrainer, DFATrainer
 from modules.trainer import CNNTrainer
 from modules.knowledge_distill import RKDDistiller
 from modules.hdc_model import HDCModel
@@ -14,8 +14,9 @@ from modules.hdc_trainer import HDCTrainer
 from modules.ioueval import iouEval
 from torchhd import embeddings
 
-TRAIN_E2E = True
-TRAIN_STUDENT = False
+TRAIN_TEZO = True
+TRAIN_DFA = True
+TRAIN_STUDENT = True
 
 BATCH_SIZE = 32
 
@@ -46,26 +47,24 @@ def compute_proto_distances(protos):
     dist_matrix = 1 - sim_matrix
     return dist_matrix
 
-def train_e2e_pipeline(name, model_size, num_classes, loss_weights, device, train_loader, common_rp_weight, num_epochs=TEACHER_EPOCHS):
-    print(f"\n--- Training {name} Teacher E2E ({model_size}) ---")
+def train_pipeline(trainer_class, name, model_size, num_classes, loss_weights, device, train_loader, common_rp_weight, num_epochs=TEACHER_EPOCHS):
+    print(f"\n--- Training {name} Teacher ({model_size}) ---")
     
     model = get_model(model_size, num_classes, aux=True)
     
-    log_dir = f"logs/{name.lower()}_teacher_e2e"
+    log_dir = f"logs/{name.lower()}_teacher"
     os.makedirs(log_dir, exist_ok=True)
     
-    trainer = EndToEndHDTrainer(
+    trainer = trainer_class(
         num_classes=num_classes, loss_weights=loss_weights, hd_dim=HD_DIM, feat_dim=FEAT_DIM,
         log_dir=log_dir, device=device, steps_per_epoch=len(train_loader),
         num_epochs=num_epochs, model=model
     )
     trainer.rp_weight = common_rp_weight.to(device)
     
-    trainer.train(train_loader, num_epochs)
+    trainer.train(train_loader, TEACHER_EPOCHS)
     
-    final_dir = f"logs/{name.lower()}_teacher"
-    os.makedirs(final_dir, exist_ok=True)
-    torch.save({"state_dict": trainer.model.state_dict()}, f"{final_dir}/SENet")
+    torch.save({"state_dict": trainer.model.state_dict()}, f"{log_dir}/SENet")
     
     return trainer.model
 
@@ -120,29 +119,40 @@ def main():
     random_protos = torch.randn(num_classes, HD_DIM, device=device)
     random_protos = F.normalize(random_protos, dim=1)
 
-    if TRAIN_E2E:
-        teacher_model = train_e2e_pipeline("E2E", TEACHER_SIZE, num_classes, loss_weights, device, train_loader_fe, common_rp_weight)
+    if TRAIN_TEZO:
+        tezo_teacher_model = train_pipeline(TeZOTrainer, "TeZO", TEACHER_SIZE, num_classes, loss_weights, device, train_loader_fe, common_rp_weight)
     else:
-        print("\n--- SKIPPED: E2E Teacher Training ---")
+        print("\n--- SKIPPED: TeZO Teacher Training ---")
+        tezo_teacher_model = get_model(TEACHER_SIZE, num_classes, aux=True)
+        ckpt_path = "logs/tezo_teacher/SENet"
+        if os.path.exists(ckpt_path):
+            tezo_teacher_model.load_state_dict(torch.load(ckpt_path)["state_dict"])
+        tezo_teacher_model.to(device)
+
+    if TRAIN_DFA:
+        dfa_teacher_model = train_pipeline(DFATrainer, "DFA", TEACHER_SIZE, num_classes, loss_weights, device, train_loader_fe, common_rp_weight)
+    else:
+        print("\n--- SKIPPED: DFA Teacher Training ---")
+        dfa_teacher_model = get_model(TEACHER_SIZE, num_classes, aux=True)
+        ckpt_path = "logs/dfa_teacher/SENet"
+        if os.path.exists(ckpt_path):
+            dfa_teacher_model.load_state_dict(torch.load(ckpt_path)["state_dict"])
+        dfa_teacher_model.to(device)
 
     if TRAIN_STUDENT:
-        os.makedirs("logs/e2e_student", exist_ok=True)
+        os.makedirs("logs/tezo_student", exist_ok=True)
+        os.makedirs("logs/dfa_student", exist_ok=True)
         os.makedirs("logs/baseline", exist_ok=True)
-        
-        if not TRAIN_E2E:
-            print(f"\n--- Loading E2E Teacher Checkpoint ---")
-            teacher_model = get_model(TEACHER_SIZE, num_classes, aux=True)
-            ckpt_path = "logs/e2e_teacher/SENet"
-            if os.path.exists(ckpt_path):
-                teacher_model.load_state_dict(torch.load(ckpt_path)["state_dict"])
-            else:
-                print(f"[WARNING] Teacher checkpoint not found at {ckpt_path}")
-            teacher_model.to(device)
 
-        print(f"\n--- Distilling E2E Teacher -> Student ({STUDENT_SIZE}) ---")
-        distiller = RKDDistiller(teacher_model, device)
-        e2e_student = distiller.distill(model_size=STUDENT_SIZE, dataloader=train_loader, epochs=DISTILLATION_EPOCHS, num_classes=num_classes, graph_name="E2E")
-        torch.save({"state_dict": e2e_student.state_dict()}, "logs/e2e_student/SENet")
+        print(f"\n--- Distilling TeZO Teacher -> Student ({STUDENT_SIZE}) ---")
+        distiller_tezo = RKDDistiller(tezo_teacher_model, device)
+        tezo_student = distiller_tezo.distill(model_size=STUDENT_SIZE, dataloader=train_loader, epochs=DISTILLATION_EPOCHS, num_classes=num_classes, graph_name="TeZO")
+        torch.save({"state_dict": tezo_student.state_dict()}, "logs/tezo_student/SENet")
+
+        print(f"\n--- Distilling DFA Teacher -> Student ({STUDENT_SIZE}) ---")
+        distiller_dfa = RKDDistiller(dfa_teacher_model, device)
+        dfa_student = distiller_dfa.distill(model_size=STUDENT_SIZE, dataloader=train_loader, epochs=DISTILLATION_EPOCHS, num_classes=num_classes, graph_name="DFA")
+        torch.save({"state_dict": dfa_student.state_dict()}, "logs/dfa_student/SENet")
 
         print(f"\n--- Training Baseline Student ({STUDENT_SIZE}) ---")
         baseline_model = get_model(STUDENT_SIZE, num_classes, aux=False)
@@ -174,7 +184,8 @@ def main():
         protos = hdc_model.classify.weight.data.clone()
         return acc, protos
 
-    acc_e2e, protos_e2e = eval_hdc("logs/e2e_student/SENet", STUDENT_SIZE, "E2E-Distilled")
+    acc_tezo, protos_tezo = eval_hdc("logs/tezo_student/SENet", STUDENT_SIZE, "TeZO-Distilled")
+    acc_dfa, protos_dfa = eval_hdc("logs/dfa_student/SENet", STUDENT_SIZE, "DFA-Distilled")
     acc_base, protos_base = eval_hdc("logs/baseline/SENet", STUDENT_SIZE, "Baseline")
 
     results = []
@@ -184,25 +195,28 @@ def main():
     results.append(f"{'Model Strategy':<25} | {'Val mIoU':<10} | {'Avg Proto Dist':<15}")
     results.append("-" * 95)
 
-    dist_e2e = compute_proto_distances(protos_e2e) if protos_e2e is not None else None
+    dist_tezo = compute_proto_distances(protos_tezo) if protos_tezo is not None else None
+    dist_dfa = compute_proto_distances(protos_dfa) if protos_dfa is not None else None
     dist_base = compute_proto_distances(protos_base) if protos_base is not None else None
 
-    if acc_e2e is not None: results.append(f"{'E2E -> Distill':<25} | {acc_e2e:<10.4f} | {dist_e2e.mean():<15.4f}")
+    if acc_tezo is not None: results.append(f"{'TeZO -> Distill':<25} | {acc_tezo:<10.4f} | {dist_tezo.mean():<15.4f}")
+    if acc_dfa is not None: results.append(f"{'DFA -> Distill':<25} | {acc_dfa:<10.4f} | {dist_dfa.mean():<15.4f}")
     if acc_base is not None: results.append(f"{'Baseline (Standard)':<25} | {acc_base:<10.4f} | {dist_base.mean():<15.4f}")
     
     results.append("-" * 95)
     results.append("\nPairwise Distance Comparison:")
-    header = f"{'Classes':<10} | {'E2E-Dist':<10} | {'Baseline':<10} | {'E-B Diff':<10}"
+    header = f"{'Classes':<10} | {'TeZO-Dist':<10} | {'DFA-Dist':<10} | {'Baseline':<10} | {'T-B Diff':<10}"
     results.append(header)
     results.append("-" * len(header))
     
     for i in range(num_classes):
         for j in range(i + 1, num_classes):
-            de = dist_e2e[i, j].item() if dist_e2e is not None else float('nan')
+            dt = dist_tezo[i, j].item() if dist_tezo is not None else float('nan')
+            dd = dist_dfa[i, j].item() if dist_dfa is not None else float('nan')
             db = dist_base[i, j].item() if dist_base is not None else float('nan')
             
-            diff = (de - db) if (dist_e2e is not None and dist_base is not None) else float('nan')
-            results.append(f"{i:02d} vs {j:02d}:   | {de:<10.4f} | {db:<10.4f} | {diff:<10.4f}")
+            diff = (dt - db) if (dist_tezo is not None and dist_base is not None) else float('nan')
+            results.append(f"{i:02d} vs {j:02d}:   | {dt:<10.4f} | {dd:<10.4f} | {db:<10.4f} | {diff:<10.4f}")
             
     final_output = "\n".join(results)
     print(final_output)

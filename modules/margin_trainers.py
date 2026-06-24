@@ -12,7 +12,7 @@ import os
 import matplotlib.pyplot as plt
 
 from modules.resnet import ResNet34
-from modules.losses import LovaszSoftmax, BoundaryLoss, ArcFaceLoss, DeCovLoss
+from modules.losses import LovaszSoftmax, BoundaryLoss, CircleLoss, DeCovLoss
 from modules.ioueval import iouEval
 from modules.trainer import AverageMeter, WarmupExpDecayLR, save_checkpoint
 
@@ -32,49 +32,6 @@ class STEQuantise(torch.autograd.Function):
 
 def ste_quantise(x: torch.Tensor) -> torch.Tensor:
     return STEQuantise.apply(x)
-
-def hd_margin_loss(feats_flat: torch.Tensor, proj_weight: torch.Tensor, class_protos: torch.Tensor, labels_flat: torch.Tensor, ignore_index: int = 0, temperature: float = 0.1, max_pixels: int = 4096, hard_quantize: bool = True, margin_criterion=None) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Per-pixel InfoNCE/ArcFace contrastive loss in HD space.
-    """
-    valid_mask = labels_flat != ignore_index
-    valid_idx = valid_mask.nonzero(as_tuple=False).squeeze(1)
-    if valid_idx.numel() == 0:
-        return feats_flat.new_zeros(1).squeeze(), valid_idx
-
-    if valid_idx.numel() > max_pixels:
-        perm = torch.randperm(valid_idx.numel(), device=feats_flat.device)
-        valid_idx = valid_idx[perm[:max_pixels]]
-
-    feats_sub = feats_flat[valid_idx]
-    labels_sub = labels_flat[valid_idx]
-
-    s = feats_sub @ proj_weight.t()
-
-    # TODO: We currently compute the margin loss (ArcFace) using the unquantized, 
-    # continuous hypervectors (when hard_quantize=False). We need to eventually 
-    # add a penalty term or regularizer that incentivizes the features to have a 
-    # close quantized representation (i.e. pushing values toward ±1).
-    if hard_quantize:
-        q = ste_quantise(s)
-    else:
-        q = s
-
-    q = q + 1e-8 # Prevent dividing by zero
-    q_norm = F.normalize(q, dim=1)
-    sims = q_norm @ class_protos.t()
-    
-    if margin_criterion is not None:
-        if isinstance(margin_criterion, ArcFaceLoss):
-            loss = margin_criterion(sims, labels_sub)
-        else:
-            sims = sims / temperature
-            loss = margin_criterion(sims, labels_sub)
-    else:
-        sims = sims / temperature
-        loss = F.cross_entropy(sims, labels_sub)
-
-    return loss, valid_idx
 
 class _BaseHDTrainer:
     """
@@ -102,7 +59,7 @@ class _BaseHDTrainer:
         margin_max_pixels: int = 4096,
         ignore_index: int = 0,
         decov_weight: float = 0.1,
-        use_arcface: bool = True,
+        
     ):
         self.num_classes = num_classes
         self.hd_dim = hd_dim
@@ -126,12 +83,12 @@ class _BaseHDTrainer:
         else:
             self.model = ResNet34(num_classes, aux=aux_loss, use_mlp_proj=True, use_l2_norm=True).to(device)
 
-        self.arcface = ArcFaceLoss().to(device) if use_arcface else None
+        self.circle_loss = CircleLoss(m=0.25, gamma=256).to(device)
         self.decov = DeCovLoss().to(device)
 
         _proj_emb = embeddings.Projection(feat_dim, hd_dim)
         self.rp_weight = _proj_emb.weight.detach().to(device)
-        self.class_protos = torch.zeros(num_classes, hd_dim, device=device)
+        
 
         self.criterion = nn.NLLLoss(weight=loss_weights.to(device)).to(device)
         self.ls = LovaszSoftmax(ignore=0).to(device)
@@ -146,13 +103,7 @@ class _BaseHDTrainer:
         self.scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
         
 
-    def set_class_protos(self, protos: torch.Tensor):
-        """
-        Update class prototype HVs from the HDCModel's classify.weight.
-        Call this before each epoch so the margin loss uses current protos.
-        protos: (C, hd_dim) normalised float tensor.
-        """
-        self.class_protos = protos.detach().to(self.device)
+
 
     def train(self, train_loader, num_epochs: int):
         seg_losses = []
@@ -213,27 +164,37 @@ class _BaseHDTrainer:
         return loss, pred
 
     def _margin_loss_from_feats(self, feats: torch.Tensor, pre_norm_feats: torch.Tensor, proj_labels: torch.Tensor, hard_quantize: bool = False) -> torch.Tensor:
-        """Project features via RP, apply STE, compute ArcFace and DeCov margin loss."""
         B, C_f, H, W = feats.shape
         feats_flat = feats.permute(0, 2, 3, 1).reshape(-1, C_f)
         pre_feats_flat = pre_norm_feats.permute(0, 2, 3, 1).reshape(-1, C_f)
         labels_flat = proj_labels.reshape(-1)
+
+        valid_idx = (labels_flat != self.ignore_index).nonzero(as_tuple=True)[0]
+        if valid_idx.numel() == 0:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        if valid_idx.numel() > self.margin_max_pixels:
+            perm = torch.randperm(valid_idx.numel(), device=self.device)
+            valid_idx = valid_idx[perm[:self.margin_max_pixels]]
+
+        feats_sub = feats_flat[valid_idx]
+        pre_feats_sub = pre_feats_flat[valid_idx]
+        labels_sub = labels_flat[valid_idx]
+
+        s = feats_sub @ self.rp_weight.t()
         
-        margin_loss, valid_idx = hd_margin_loss(
-            feats_flat, self.rp_weight, self.class_protos,
-            labels_flat, self.ignore_index,
-            self.margin_temperature, self.margin_max_pixels,
-            hard_quantize=hard_quantize,
-            margin_criterion=self.arcface
-        )
-        
-        if valid_idx.numel() > 0:
-            decov_loss = self.decov(pre_feats_flat[valid_idx])
-            loss = margin_loss + self.decov_weight * decov_loss
+        if hard_quantize:
+            q = ste_quantise(s)
         else:
-            loss = margin_loss
-            
-        return loss
+            q = s
+
+        q = q + 1e-8
+        q_norm = F.normalize(q, dim=1)
+
+        circle_loss = self.circle_loss(q_norm, labels_sub)
+        decov_loss = self.decov(pre_feats_sub)
+
+        return circle_loss + self.decov_weight * decov_loss
 
     def _eval_metrics(self, pred, proj_labels):
         self.evaluator.reset()
@@ -631,120 +592,3 @@ class DFATrainer(_BaseHDTrainer):
             self.stats_file.close()
         for h in getattr(self, '_hooks', []):
             h.remove()
-
-class EndToEndHDTrainer(_BaseHDTrainer):
-    """
-    Trains the backbone and HD class prototypes jointly using exact backprop.
-    """
-    HEAD_PARAM_NAMES = ("conv_1", "conv_2", "semantic_output", "aux_head")
-
-    def __init__(self, num_classes: int, loss_weights: torch.Tensor, hd_dim: int, feat_dim: int = 128, log_dir: str = "logs", device: torch.device = torch.device("cpu"), **base_kwargs):
-        super().__init__(num_classes, loss_weights, hd_dim, feat_dim, log_dir, device, **base_kwargs)
-        
-        self.class_protos = nn.Parameter(torch.randn(num_classes, hd_dim, device=device))
-        
-        self.optimizer = optim.SGD(
-            [
-                {"params": self.model.parameters()},
-                {"params": self.class_protos, "lr": 0.05}
-            ],
-            lr=0.01,
-            momentum=0.9,
-            weight_decay=1e-4
-        )
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.steps_per_epoch * 80)
-
-        os.makedirs(self.log_dir, exist_ok=True)
-        self.stats_file = open(os.path.join(self.log_dir, "e2e_stats.csv"), "w")
-        self.stats_file.write("step,loss_seg,loss_margin,gn_seg_pred,gn_margin_feats,gn_layer1,gn_layer2,gn_layer3,gn_layer4,gn_backbone,gn_head,gn_protos\n")
-        self.global_step = 0
-
-    def _train_epoch(self, loader, epoch, total_epochs):
-        seg_m = AverageMeter()
-        margin_m = AverageMeter()
-        acc_m = AverageMeter()
-        iou_m = AverageMeter()
-        self.model.train()
-
-        # Harsher warmup: quadratic curve over the first 50% of training
-        progress = epoch / max(1, total_epochs * 0.5)
-        warmup_factor = min(1.0, progress) ** 2
-        current_margin_lambda = self.margin_lambda * warmup_factor
-
-        net = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-
-        for in_vol, _, proj_labels, *_ in tqdm(loader, desc=f"[E2E] Train {epoch+1}/{total_epochs} (λ={current_margin_lambda:.3f})"):
-            in_vol = in_vol.to(self.device)
-            proj_labels = proj_labels.to(self.device).long()
-            N = in_vol.size(0)
-
-            self.optimizer.zero_grad()
-
-            with torch.amp.autocast('cuda'):
-                out = net(in_vol, return_feat=True, return_pre_feat=True)
-                if self.aux_loss:
-                    pred, aux, feats, pre_feats = out
-                    z2, z4, z8 = aux
-                    lam = self.aux_lambda
-                    seg_loss = (self._seg_loss(pred, proj_labels) + lam * self._seg_loss(z2, proj_labels) + lam * self._seg_loss(z4, proj_labels) + lam * self._seg_loss(z8, proj_labels))
-                else:
-                    pred, feats, pre_feats = out
-                    seg_loss = self._seg_loss(pred, proj_labels)
-
-                margin_loss = current_margin_lambda * self._margin_loss_from_feats(feats, pre_feats, proj_labels)
-                total_loss = seg_loss + margin_loss
-
-            feats.retain_grad()
-            pre_feats.retain_grad()
-            pred.retain_grad()
-
-            self.scaler.scale(total_loss).backward()
-
-            self.scaler.unscale_(self.optimizer)
-
-            scale = self.scaler.get_scale()
-            gn_margin_feats_norm = feats.grad.norm().item() / scale if feats.grad is not None else 0.0
-            gn_margin_pre_feats_norm = pre_feats.grad.norm().item() / scale if (pre_feats.grad is not None and pre_feats is not feats) else 0.0
-            gn_margin_feats = (gn_margin_feats_norm**2 + gn_margin_pre_feats_norm**2)**0.5
-            gn_seg_pred = pred.grad.norm().item() / scale if pred.grad is not None else 0.0
-
-            layer1_params = [p for n, p in self.model.named_parameters() if 'layer1' in n]
-            layer2_params = [p for n, p in self.model.named_parameters() if 'layer2' in n]
-            layer3_params = [p for n, p in self.model.named_parameters() if 'layer3' in n]
-            layer4_params = [p for n, p in self.model.named_parameters() if 'layer4' in n]
-
-            gn_layer1 = sum(p.grad.norm().item()**2 for p in layer1_params if p.grad is not None)**0.5
-            gn_layer2 = sum(p.grad.norm().item()**2 for p in layer2_params if p.grad is not None)**0.5
-            gn_layer3 = sum(p.grad.norm().item()**2 for p in layer3_params if p.grad is not None)**0.5
-            gn_layer4 = sum(p.grad.norm().item()**2 for p in layer4_params if p.grad is not None)**0.5
-
-            backbone_params = [p for n, p in self.model.named_parameters() if not any(h in n for h in self.HEAD_PARAM_NAMES)]
-            head_params = [p for n, p in self.model.named_parameters() if any(h in n for h in self.HEAD_PARAM_NAMES)]
-
-            grad_norm_backbone = sum(p.grad.norm().item()**2 for p in backbone_params if p.grad is not None)**0.5
-            grad_norm_head = sum(p.grad.norm().item()**2 for p in head_params if p.grad is not None)**0.5
-            grad_norm_protos = self.class_protos.grad.norm().item() if self.class_protos.grad is not None else 0.0
-
-            if hasattr(self, 'stats_file'):
-                self.global_step += 1
-                self.stats_file.write(f"{self.global_step},{seg_loss.item():.4f},{margin_loss.item():.4f},{gn_seg_pred:.4f},{gn_margin_feats:.4f},{gn_layer1:.4f},{gn_layer2:.4f},{gn_layer3:.4f},{gn_layer4:.4f},{grad_norm_backbone:.4f},{grad_norm_head:.4f},{grad_norm_protos:.4f}\n")
-                self.stats_file.flush()
-
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-
-            self.scheduler.step()
-
-            with torch.no_grad():
-                acc, jac = self._eval_metrics(pred, proj_labels)
-
-            seg_m.update(seg_loss.item(), N)
-            margin_m.update(margin_loss.item(), N)
-            acc_m.update(acc.item(), N)
-            iou_m.update(jac.item(), N)
-
-        return acc_m.avg, iou_m.avg, seg_m.avg, margin_m.avg
-
-    def __del__(self):
-        if hasattr(self, 'stats_file') and not self.stats_file.closed:
-            self.stats_file.close()
