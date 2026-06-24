@@ -73,6 +73,7 @@ class _BaseHDTrainer:
         self.margin_max_pixels = margin_max_pixels
         self.ignore_index = ignore_index
         self.decov_weight = decov_weight
+        self.steps_per_epoch = steps_per_epoch
 
         ignore_idx = (loss_weights < 1e-10).nonzero(as_tuple=True)[0].tolist()
 
@@ -211,6 +212,7 @@ class TeZOTrainer(_BaseHDTrainer):
     DEFAULT_HEAD_NAMES = ("conv_1", "conv_2", "semantic_output", "aux_head")
 
     def __init__(self, num_classes: int, loss_weights: torch.Tensor, hd_dim: int, feat_dim: int = 128, log_dir: str = "logs", device: torch.device = torch.device("cpu"), zo_epsilon: float = 1e-3, zo_ema_beta: float = 0.99, zo_n_samples: int = 1, zo_lr: float = 1e-5, head_param_names: Tuple[str, ...] = DEFAULT_HEAD_NAMES, **base_kwargs):
+        base_kwargs.pop("num_epochs", None)
         super().__init__(num_classes, loss_weights, hd_dim, feat_dim, log_dir, device, **base_kwargs)
         self.zo_epsilon = zo_epsilon
         self.zo_ema_beta = zo_ema_beta
@@ -390,6 +392,7 @@ class DFATrainer(_BaseHDTrainer):
     HEAD_PARAM_NAMES = ("conv_1", "conv_2", "semantic_output", "aux_head")
 
     def __init__(self, num_classes: int, loss_weights: torch.Tensor, hd_dim: int, feat_dim: int = 128, log_dir: str = "logs", device: torch.device = torch.device("cpu"), dfa_layer_names: Tuple[str, ...] = DEFAULT_DFA_LAYERS, dfa_lr: float = 1e-4, **base_kwargs):
+        base_kwargs.pop("num_epochs", None)
         super().__init__(num_classes, loss_weights, hd_dim, feat_dim, log_dir, device, **base_kwargs)
         self.dfa_layer_names = dfa_layer_names
         self.dfa_lr = dfa_lr
