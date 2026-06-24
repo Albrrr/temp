@@ -116,7 +116,6 @@ class _BaseHDTrainer:
         self.margin_max_pixels = margin_max_pixels
         self.ignore_index = ignore_index
         self.decov_weight = decov_weight
-        self.steps_per_epoch = steps_per_epoch
 
         ignore_idx = (loss_weights < 1e-10).nonzero(as_tuple=True)[0].tolist()
 
@@ -144,7 +143,8 @@ class _BaseHDTrainer:
         self.scheduler = WarmupExpDecayLR(self.optimizer, lr, warmup_steps, final_decay)
 
         self.evaluator = iouEval(num_classes, device, ignore_idx)
-        self.scaler = torch.amp.GradScaler('cuda')
+        self.scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
+        
 
     def set_class_protos(self, protos: torch.Tensor):
         """
@@ -636,7 +636,9 @@ class EndToEndHDTrainer(_BaseHDTrainer):
     """
     Trains the backbone and HD class prototypes jointly using exact backprop.
     """
-    def __init__(self, num_classes: int, loss_weights: torch.Tensor, hd_dim: int, feat_dim: int = 128, log_dir: str = "logs", device: torch.device = torch.device("cpu"), num_epochs: int = 80, **base_kwargs):
+    HEAD_PARAM_NAMES = ("conv_1", "conv_2", "semantic_output", "aux_head")
+
+    def __init__(self, num_classes: int, loss_weights: torch.Tensor, hd_dim: int, feat_dim: int = 128, log_dir: str = "logs", device: torch.device = torch.device("cpu"), **base_kwargs):
         super().__init__(num_classes, loss_weights, hd_dim, feat_dim, log_dir, device, **base_kwargs)
         
         self.class_protos = nn.Parameter(torch.randn(num_classes, hd_dim, device=device))
@@ -650,10 +652,12 @@ class EndToEndHDTrainer(_BaseHDTrainer):
             momentum=0.9,
             weight_decay=1e-4
         )
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=self.steps_per_epoch * num_epochs
-        )
-        self.scaler = torch.amp.GradScaler('cuda')
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.steps_per_epoch * 80)
+
+        os.makedirs(self.log_dir, exist_ok=True)
+        self.stats_file = open(os.path.join(self.log_dir, "e2e_stats.csv"), "w")
+        self.stats_file.write("step,loss_seg,loss_margin,gn_seg_pred,gn_margin_feats,gn_layer1,gn_layer2,gn_layer3,gn_layer4,gn_backbone,gn_head,gn_protos\n")
+        self.global_step = 0
 
     def _train_epoch(self, loader, epoch, total_epochs):
         seg_m = AverageMeter()
@@ -662,9 +666,14 @@ class EndToEndHDTrainer(_BaseHDTrainer):
         iou_m = AverageMeter()
         self.model.train()
 
+        # Harsher warmup: quadratic curve over the first 50% of training
+        progress = epoch / max(1, total_epochs * 0.5)
+        warmup_factor = min(1.0, progress) ** 2
+        current_margin_lambda = self.margin_lambda * warmup_factor
+
         net = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
-        for in_vol, _, proj_labels, *_ in tqdm(loader, desc=f"[E2E] Train {epoch+1}/{total_epochs}"):
+        for in_vol, _, proj_labels, *_ in tqdm(loader, desc=f"[E2E] Train {epoch+1}/{total_epochs} (λ={current_margin_lambda:.3f})"):
             in_vol = in_vol.to(self.device)
             proj_labels = proj_labels.to(self.device).long()
             N = in_vol.size(0)
@@ -682,10 +691,45 @@ class EndToEndHDTrainer(_BaseHDTrainer):
                     pred, feats, pre_feats = out
                     seg_loss = self._seg_loss(pred, proj_labels)
 
-                margin_loss = self.margin_lambda * self._margin_loss_from_feats(feats, pre_feats, proj_labels)
+                margin_loss = current_margin_lambda * self._margin_loss_from_feats(feats, pre_feats, proj_labels)
                 total_loss = seg_loss + margin_loss
 
+            feats.retain_grad()
+            pre_feats.retain_grad()
+            pred.retain_grad()
+
             self.scaler.scale(total_loss).backward()
+
+            self.scaler.unscale_(self.optimizer)
+
+            scale = self.scaler.get_scale()
+            gn_margin_feats_norm = feats.grad.norm().item() / scale if feats.grad is not None else 0.0
+            gn_margin_pre_feats_norm = pre_feats.grad.norm().item() / scale if (pre_feats.grad is not None and pre_feats is not feats) else 0.0
+            gn_margin_feats = (gn_margin_feats_norm**2 + gn_margin_pre_feats_norm**2)**0.5
+            gn_seg_pred = pred.grad.norm().item() / scale if pred.grad is not None else 0.0
+
+            layer1_params = [p for n, p in self.model.named_parameters() if 'layer1' in n]
+            layer2_params = [p for n, p in self.model.named_parameters() if 'layer2' in n]
+            layer3_params = [p for n, p in self.model.named_parameters() if 'layer3' in n]
+            layer4_params = [p for n, p in self.model.named_parameters() if 'layer4' in n]
+
+            gn_layer1 = sum(p.grad.norm().item()**2 for p in layer1_params if p.grad is not None)**0.5
+            gn_layer2 = sum(p.grad.norm().item()**2 for p in layer2_params if p.grad is not None)**0.5
+            gn_layer3 = sum(p.grad.norm().item()**2 for p in layer3_params if p.grad is not None)**0.5
+            gn_layer4 = sum(p.grad.norm().item()**2 for p in layer4_params if p.grad is not None)**0.5
+
+            backbone_params = [p for n, p in self.model.named_parameters() if not any(h in n for h in self.HEAD_PARAM_NAMES)]
+            head_params = [p for n, p in self.model.named_parameters() if any(h in n for h in self.HEAD_PARAM_NAMES)]
+
+            grad_norm_backbone = sum(p.grad.norm().item()**2 for p in backbone_params if p.grad is not None)**0.5
+            grad_norm_head = sum(p.grad.norm().item()**2 for p in head_params if p.grad is not None)**0.5
+            grad_norm_protos = self.class_protos.grad.norm().item() if self.class_protos.grad is not None else 0.0
+
+            if hasattr(self, 'stats_file'):
+                self.global_step += 1
+                self.stats_file.write(f"{self.global_step},{seg_loss.item():.4f},{margin_loss.item():.4f},{gn_seg_pred:.4f},{gn_margin_feats:.4f},{gn_layer1:.4f},{gn_layer2:.4f},{gn_layer3:.4f},{gn_layer4:.4f},{grad_norm_backbone:.4f},{grad_norm_head:.4f},{grad_norm_protos:.4f}\n")
+                self.stats_file.flush()
+
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
@@ -700,3 +744,7 @@ class EndToEndHDTrainer(_BaseHDTrainer):
             iou_m.update(jac.item(), N)
 
         return acc_m.avg, iou_m.avg, seg_m.avg, margin_m.avg
+
+    def __del__(self):
+        if hasattr(self, 'stats_file') and not self.stats_file.closed:
+            self.stats_file.close()
