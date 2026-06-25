@@ -73,6 +73,7 @@ class _BaseHDTrainer:
         self.margin_max_pixels = margin_max_pixels
         self.ignore_index = ignore_index
         self.decov_weight = decov_weight
+        self.steps_per_epoch = steps_per_epoch
 
         ignore_idx = (loss_weights < 1e-10).nonzero(as_tuple=True)[0].tolist()
 
@@ -210,7 +211,7 @@ class TeZOTrainer(_BaseHDTrainer):
     """
     DEFAULT_HEAD_NAMES = ("conv_1", "conv_2", "semantic_output", "aux_head")
 
-    def __init__(self, num_classes: int, loss_weights: torch.Tensor, hd_dim: int, feat_dim: int = 128, log_dir: str = "logs", device: torch.device = torch.device("cpu"), zo_epsilon: float = 1e-3, zo_ema_beta: float = 0.99, zo_n_samples: int = 1, zo_lr: float = 1e-5, head_param_names: Tuple[str, ...] = DEFAULT_HEAD_NAMES, **base_kwargs):
+    def __init__(self, num_classes: int, loss_weights: torch.Tensor, hd_dim: int, feat_dim: int = 128, log_dir: str = "logs", device: torch.device = torch.device("cpu"), zo_epsilon: float = 1e-4, zo_ema_beta: float = 0.99, zo_n_samples: int = 1, zo_lr: float = 1e-4, head_param_names: Tuple[str, ...] = DEFAULT_HEAD_NAMES, **base_kwargs):
         super().__init__(num_classes, loss_weights, hd_dim, feat_dim, log_dir, device, **base_kwargs)
         self.zo_epsilon = zo_epsilon
         self.zo_ema_beta = zo_ema_beta
@@ -282,8 +283,8 @@ class TeZOTrainer(_BaseHDTrainer):
 
             for n, p in self._backbone_params:
                 p.data.add_(zs[n], alpha=eps)
-            with torch.amp.autocast('cuda'):
-                loss_pos = self._zo_loss(in_vol, proj_labels)
+
+            loss_pos = self._zo_loss(in_vol, proj_labels)
 
             for n, p in self._backbone_params:
                 p.data.add_(zs[n], alpha=-2 * eps)
@@ -293,10 +294,6 @@ class TeZOTrainer(_BaseHDTrainer):
                 p.data.add_(zs[n], alpha=eps)
 
             g_scalar = (loss_pos - loss_neg) / (2 * eps)
-
-            # Divide by D for regularization (MeZO) to prevent massive variance scaling
-            D = sum(p.numel() for _, p in self._backbone_params)
-            g_scalar = g_scalar / D
 
             g_scalar = torch.nan_to_num(g_scalar, nan=0.0, posinf=1000.0, neginf=-1000.0)
 
@@ -390,6 +387,7 @@ class DFATrainer(_BaseHDTrainer):
     HEAD_PARAM_NAMES = ("conv_1", "conv_2", "semantic_output", "aux_head")
 
     def __init__(self, num_classes: int, loss_weights: torch.Tensor, hd_dim: int, feat_dim: int = 128, log_dir: str = "logs", device: torch.device = torch.device("cpu"), dfa_layer_names: Tuple[str, ...] = DEFAULT_DFA_LAYERS, dfa_lr: float = 1e-4, **base_kwargs):
+        base_kwargs.pop("num_epochs", None)
         super().__init__(num_classes, loss_weights, hd_dim, feat_dim, log_dir, device, **base_kwargs)
         self.dfa_layer_names = dfa_layer_names
         self.dfa_lr = dfa_lr
@@ -502,13 +500,16 @@ class DFATrainer(_BaseHDTrainer):
             perm = torch.randperm(valid_idx.numel(), device=self.device)
             valid_idx = valid_idx[perm[:self.margin_max_pixels]]
 
-        feats_sub  = feats_flat[valid_idx]
+        feats_sub  = feats_flat[valid_idx].clone().float().requires_grad_(True)
         labels_sub = labels_flat[valid_idx]
 
-        with torch.no_grad():
-            s = feats_sub @ self.rp_weight.t()
-            proto_true = self.class_protos[labels_sub]
-            e = F.normalize(s, dim=1) - proto_true
+        with torch.enable_grad(), torch.amp.autocast('cuda', enabled=False):
+            s = feats_sub @ self.rp_weight.float().t()
+            s.retain_grad()
+            q_norm = F.normalize(s, dim=1)
+            loss = self.margin_lambda * self.circle_loss(q_norm, labels_sub)
+            loss.backward()
+            e = s.grad
 
         for name, B_l in self._feedback.items():
             delta_flat = e @ B_l.float()
@@ -518,7 +519,7 @@ class DFATrainer(_BaseHDTrainer):
             delta_full[valid_idx] = delta_flat
             delta_spatial = (delta_full.reshape(B, H, W, C_l).permute(0, 3, 1, 2).contiguous())
 
-            self._delta[name] = delta_spatial / max(1, valid_idx.numel())
+            self._delta[name] = delta_spatial
 
     def _train_epoch(self, loader, epoch, total_epochs):
         seg_m = AverageMeter()
