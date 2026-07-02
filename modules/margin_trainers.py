@@ -12,7 +12,7 @@ import os
 import matplotlib.pyplot as plt
 
 from modules.resnet import ResNet34
-from modules.losses import LovaszSoftmax, BoundaryLoss, CircleLoss, DeCovLoss
+from modules.losses import LovaszSoftmax, BoundaryLoss, CircleLoss, VICRegLoss
 from modules.ioueval import iouEval
 from modules.trainer import AverageMeter, WarmupExpDecayLR, save_checkpoint
 
@@ -85,7 +85,7 @@ class _BaseHDTrainer:
             self.model = ResNet34(num_classes, aux=aux_loss, use_mlp_proj=True, use_l2_norm=True).to(device)
 
         self.circle_loss = CircleLoss(m=0.25, gamma=256).to(device)
-        self.decov = DeCovLoss().to(device)
+        self.decov = VICRegLoss().to(device)
 
         _proj_emb = embeddings.Projection(feat_dim, hd_dim)
         self.rp_weight = _proj_emb.weight.detach().to(device)
@@ -205,32 +205,30 @@ class _BaseHDTrainer:
     def _train_epoch(self, loader, epoch, total_epochs):
         raise NotImplementedError
 
-class TeZOTrainer(_BaseHDTrainer):
+class MeZOTrainer(_BaseHDTrainer):
     """
-    Temporal Zero-Order Optimisation trainer.
+    Memory-Efficient Zeroth-Order (MeZO) Optimisation trainer.
+    Replaces naive TeZO.
     """
     DEFAULT_HEAD_NAMES = ("conv_1", "conv_2", "semantic_output", "aux_head")
 
-    def __init__(self, num_classes: int, loss_weights: torch.Tensor, hd_dim: int, feat_dim: int = 128, log_dir: str = "logs", device: torch.device = torch.device("cpu"), zo_epsilon: float = 1e-4, zo_ema_beta: float = 0.99, zo_n_samples: int = 1, zo_lr: float = 1e-4, head_param_names: Tuple[str, ...] = DEFAULT_HEAD_NAMES, **base_kwargs):
+    def __init__(self, num_classes: int, loss_weights: torch.Tensor, hd_dim: int, feat_dim: int = 128, log_dir: str = "logs", device: torch.device = torch.device("cpu"), zo_epsilon: float = 1e-3, zo_lr: float = 1e-5, head_param_names: Tuple[str, ...] = DEFAULT_HEAD_NAMES, use_pcgrad: bool = True, **base_kwargs):
         super().__init__(num_classes, loss_weights, hd_dim, feat_dim, log_dir, device, **base_kwargs)
         self.zo_epsilon = zo_epsilon
-        self.zo_ema_beta = zo_ema_beta
-        self.zo_n_samples = zo_n_samples
         self.zo_lr = zo_lr
         self.head_param_names = head_param_names
+        self.use_pcgrad = use_pcgrad
 
         os.makedirs(self.log_dir, exist_ok=True)
-        self.stats_file = open(os.path.join(self.log_dir, "tezo_stats.csv"), "w")
-        self.stats_file.write("step,g_scalar,accum_norm,ema_grad_norm,loss_pos,loss_neg\n")
+        self.stats_file = open(os.path.join(self.log_dir, "mezo_stats.csv"), "w")
+        self.stats_file.write("step,g_scalar,loss_pos,loss_neg\n")
         self.global_step = 0
 
-        self._ema_grads: Dict[str, torch.Tensor] = {
-            name: torch.zeros_like(p)
-            for name, p in self.model.named_parameters()
-        }
-
         head_params = [p for n, p in self.model.named_parameters() if any(h in n for h in self.head_param_names)]
-        backbone_params = [p for n, p in self.model.named_parameters() if not any(h in n for h in self.head_param_names)]
+        self._backbone_params = [
+            (n, p) for n, p in self.model.named_parameters()
+            if not any(h in n for h in self.head_param_names)
+        ]
 
         self.head_optimizer = optim.SGD(
             head_params,
@@ -240,18 +238,10 @@ class TeZOTrainer(_BaseHDTrainer):
         )
         self.optimizer = self.head_optimizer
         self.scheduler = WarmupExpDecayLR(self.optimizer, self.optimizer.param_groups[0]["lr"], self.scheduler.warmup_steps, self.scheduler.decay_rate)
-        self._backbone_params: List[Tuple[str, nn.Parameter]] = [
-            (n, p) for n, p in self.model.named_parameters()
-            if not any(h in n for h in self.head_param_names)
-        ]
 
     @torch.no_grad()
-    def _zo_loss(self, in_vol: torch.Tensor, proj_labels: torch.Tensor) -> torch.Tensor:
-        """
-        Scalar loss for ZO perturbation.
-        """
+    def _zo_loss(self, in_vol: torch.Tensor, proj_labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         net = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-
         out = net(in_vol, return_feat=True, return_pre_feat=True)
         
         if self.aux_loss:
@@ -264,71 +254,61 @@ class TeZOTrainer(_BaseHDTrainer):
             l_seg = self._seg_loss(pred, proj_labels)
 
         l_margin = self._margin_loss_from_feats(feats, pre_feats, proj_labels)
-
-        return l_seg + (self.margin_lambda * l_margin)
+        return l_seg, l_margin
 
     @torch.no_grad()
-    def _zo_step(self, in_vol: torch.Tensor, proj_labels: torch.Tensor):
-        """
-        Estimate ZO gradient for backbone params, EMA-smooth, apply update.
-        """
+    def _mezo_step(self, in_vol: torch.Tensor, proj_labels: torch.Tensor):
         eps = self.zo_epsilon
-        accumulated = {n: torch.zeros_like(p) for n, p in self._backbone_params}
-
         was_training = self.model.training
         self.model.eval()
 
-        for _ in range(self.zo_n_samples):
-            zs = {n: torch.randn_like(p) for n, p in self._backbone_params}
+        seed = torch.randint(0, 2**32 - 1, (1,)).item()
 
-            for n, p in self._backbone_params:
-                p.data.add_(zs[n], alpha=eps)
+        # Step 1: Forward +
+        torch.manual_seed(seed)
+        for _, p in self._backbone_params:
+            z = torch.randn_like(p)
+            p.data.add_(z, alpha=eps)
+            
+        loss_pos_seg, loss_pos_margin = self._zo_loss(in_vol, proj_labels)
 
-            loss_pos = self._zo_loss(in_vol, proj_labels)
+        # Step 2: Forward -
+        torch.manual_seed(seed)
+        for _, p in self._backbone_params:
+            z = torch.randn_like(p)
+            p.data.add_(z, alpha=-2 * eps)
+            
+        loss_neg_seg, loss_neg_margin = self._zo_loss(in_vol, proj_labels)
 
-            for n, p in self._backbone_params:
-                p.data.add_(zs[n], alpha=-2 * eps)
-            loss_neg = self._zo_loss(in_vol, proj_labels)
+        # Step 3: Compute scalar and update
+        g_scalar_seg = (loss_pos_seg - loss_neg_seg) / (2 * eps)
+        g_scalar_margin = (loss_pos_margin - loss_neg_margin) / (2 * eps)
 
-            for n, p in self._backbone_params:
-                p.data.add_(zs[n], alpha=eps)
+        if self.use_pcgrad and (g_scalar_seg * g_scalar_margin < 0):
+            g_scalar_margin = torch.tensor(0.0, device=self.device)
 
-            g_scalar = (loss_pos - loss_neg) / (2 * eps)
+        g_scalar = g_scalar_seg + self.margin_lambda * g_scalar_margin
+        g_scalar = torch.nan_to_num(g_scalar, nan=0.0, posinf=10.0, neginf=-10.0)
 
-            g_scalar = torch.nan_to_num(g_scalar, nan=0.0, posinf=1000.0, neginf=-1000.0)
-
-            for n, _ in self._backbone_params:
-                accumulated[n].add_(zs[n], alpha=g_scalar.item())
+        lr = self.zo_lr
+        wd = self.head_optimizer.param_groups[0]["weight_decay"]
+        
+        torch.manual_seed(seed)
+        for _, p in self._backbone_params:
+            z = torch.randn_like(p)
+            p.data.add_(z, alpha=eps - lr * g_scalar.item())
+            if wd > 0:
+                p.data.mul_(1.0 - lr * wd)
 
         if was_training:
             self.model.train()
 
-        for n in accumulated:
-            accumulated[n].div_(self.zo_n_samples)
-
-        accum_norm_val = sum(accumulated[n].norm().item()**2 for n in accumulated)**0.5 # Clip accumulated ZO gradients
-        if accum_norm_val > 100.0:
-            clip_coef = 100.0 / (accum_norm_val + 1e-6)
-            for n in accumulated:
-                accumulated[n].mul_(clip_coef)
-
-        β = self.zo_ema_beta
-        for n, p in self._backbone_params:
-            self._ema_grads[n].mul_(β).add_(accumulated[n], alpha=1 - β)
-
-        accum_norm = sum(accumulated[n].norm().item()**2 for n in accumulated)**0.5
-        ema_norm = sum(self._ema_grads[n].norm().item()**2 for n in self._ema_grads)**0.5
         if hasattr(self, 'stats_file'):
             self.global_step += 1
-            self.stats_file.write(f"{self.global_step},{g_scalar.item():.4f},{accum_norm:.4f},{ema_norm:.4f},{loss_pos.item():.4f},{loss_neg.item():.4f}\n")
+            loss_pos = loss_pos_seg + self.margin_lambda * loss_pos_margin
+            loss_neg = loss_neg_seg + self.margin_lambda * loss_neg_margin
+            self.stats_file.write(f"{self.global_step},{g_scalar.item():.4f},{loss_pos.item():.4f},{loss_neg.item():.4f}\n")
             self.stats_file.flush()
-
-        lr = self.zo_lr
-        wd = self.head_optimizer.param_groups[0]["weight_decay"]
-        for n, p in self._backbone_params:
-            if wd > 0:
-                p.data.mul_(1.0 - lr * wd)
-            p.data.add_(self._ema_grads[n], alpha=-lr)
 
     def _train_epoch(self, loader, epoch, total_epochs):
         seg_m = AverageMeter()
@@ -337,31 +317,42 @@ class TeZOTrainer(_BaseHDTrainer):
         iou_m = AverageMeter()
         self.model.train()
 
-        for in_vol, _, proj_labels, *_ in tqdm(loader, desc=f"[TeZO] Train {epoch+1}/{total_epochs}"):
+        for in_vol, _, proj_labels, *_ in tqdm(loader, desc=f"[MeZO] Train {epoch+1}/{total_epochs}"):
             in_vol = in_vol.to(self.device)
             proj_labels = proj_labels.to(self.device).long()
             N = in_vol.size(0)
 
-            self._zo_step(in_vol, proj_labels)
+            self._mezo_step(in_vol, proj_labels)
+
+            # Freeze backbone to avoid storing activations and wasting VRAM
+            for _, p in self._backbone_params:
+                p.requires_grad = False
 
             self.head_optimizer.zero_grad()
             with torch.amp.autocast('cuda'):
-                seg_loss, pred = self._full_seg_loss(in_vol, proj_labels)
+                net = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+                out = net(in_vol, return_feat=True, return_pre_feat=True)
+                if self.aux_loss:
+                    pred, aux, feats, pre_feats = out
+                    z2, z4, z8 = aux
+                    lam = self.aux_lambda
+                    seg_loss = (self._seg_loss(pred, proj_labels) + lam * self._seg_loss(z2, proj_labels) + lam * self._seg_loss(z4, proj_labels) + lam * self._seg_loss(z8, proj_labels))
+                else:
+                    pred, feats, pre_feats = out
+                    seg_loss = self._seg_loss(pred, proj_labels)
 
             self.scaler.scale(seg_loss).backward()
+            
+            # Unfreeze backbone
+            for _, p in self._backbone_params:
+                p.requires_grad = True
+
             self.scaler.step(self.head_optimizer)
             self.scaler.update()
             self.scheduler.step()
 
             with torch.no_grad():
-                net = self.model.module if isinstance(
-                    self.model, nn.DataParallel) else self.model
-                feats, pre_feats = net(in_vol, only_feat=True, return_pre_feat=True)
-                feats = feats.detach()
-                pre_feats = pre_feats.detach()
-
-            with torch.no_grad():
-                margin_loss = self.margin_lambda * self._margin_loss_from_feats(feats, pre_feats, proj_labels)
+                margin_loss = self.margin_lambda * self._margin_loss_from_feats(feats.detach(), pre_feats.detach(), proj_labels)
             margin_loss_val = margin_loss.item()
 
             with torch.no_grad():
@@ -378,60 +369,40 @@ class TeZOTrainer(_BaseHDTrainer):
         if hasattr(self, 'stats_file') and not self.stats_file.closed:
             self.stats_file.close()
 
-class DFATrainer(_BaseHDTrainer):
+class LocalGradTrainer(_BaseHDTrainer):
     """
-    Direct Feedback Alignment trainer.
+    Gradient-Isolated Learning trainer (Local Exact Gradients) with PCGrad.
+    Replaces DFA.
     """
+    DEFAULT_LAYERS = ("layer1", "layer2", "layer3", "layer4")
 
-    DEFAULT_DFA_LAYERS = ("layer1", "layer2", "layer3", "layer4")
-    HEAD_PARAM_NAMES = ("conv_1", "conv_2", "semantic_output", "aux_head")
-
-    def __init__(self, num_classes: int, loss_weights: torch.Tensor, hd_dim: int, feat_dim: int = 128, log_dir: str = "logs", device: torch.device = torch.device("cpu"), dfa_layer_names: Tuple[str, ...] = DEFAULT_DFA_LAYERS, dfa_lr: float = 1e-4, **base_kwargs):
+    def __init__(self, num_classes: int, loss_weights: torch.Tensor, hd_dim: int, feat_dim: int = 128, log_dir: str = "logs", device: torch.device = torch.device("cpu"), local_layer_names: Tuple[str, ...] = DEFAULT_LAYERS, use_pcgrad: bool = True, **base_kwargs):
         base_kwargs.pop("num_epochs", None)
         super().__init__(num_classes, loss_weights, hd_dim, feat_dim, log_dir, device, **base_kwargs)
-        self.dfa_layer_names = dfa_layer_names
-        self.dfa_lr = dfa_lr
+        self.local_layer_names = local_layer_names
+        self.use_pcgrad = use_pcgrad
 
         os.makedirs(self.log_dir, exist_ok=True)
-        self.stats_file = open(os.path.join(self.log_dir, "dfa_stats.csv"), "w")
-        self.stats_file.write("step,delta_norm,grad_norm_backbone,grad_norm_head\n")
+        self.stats_file = open(os.path.join(self.log_dir, "local_grad_stats.csv"), "w")
+        self.stats_file.write("step,loss_layer1,loss_layer2,loss_layer3,loss_layer4\n")
         self.global_step = 0
 
-        head_params     = [p for n, p in self.model.named_parameters() if any(h in n for h in self.HEAD_PARAM_NAMES)]
-        backbone_params = [p for n, p in self.model.named_parameters() if not any(h in n for h in self.HEAD_PARAM_NAMES)]
-
-        self.head_optimizer = optim.SGD(
-            head_params,
+        self.optimizer = optim.SGD(
+            self.model.parameters(),
             lr=self.optimizer.param_groups[0]["lr"],
             momentum=self.optimizer.param_groups[0]["momentum"],
             weight_decay=self.optimizer.param_groups[0]["weight_decay"],
         )
-        self.backbone_optimizer = optim.SGD(
-            backbone_params, lr=dfa_lr,
-            momentum=self.optimizer.param_groups[0]["momentum"],
-            weight_decay=self.optimizer.param_groups[0]["weight_decay"],
-        )
-        self.optimizer = self.head_optimizer
         self.scheduler = WarmupExpDecayLR(self.optimizer, self.optimizer.param_groups[0]["lr"], self.scheduler.warmup_steps, self.scheduler.decay_rate)
-        self.backbone_scheduler = WarmupExpDecayLR(
-            self.backbone_optimizer,
-            self.dfa_lr,
-            self.scheduler.warmup_steps,
-            self.scheduler.decay_rate
-        )
 
-        self._feedback: Dict[str, torch.Tensor] = {}
-        self._layer_out_shape: Dict[str, torch.Size] = {}
-        self._delta: Dict[str, torch.Tensor] = {}
+        self._local_rp: Dict[str, torch.Tensor] = {}
         self._hooks: List = []
+        self._current_labels = None
+        self._local_losses = {}
 
-        self._register_feedback_matrices()
+        self._register_local_hooks()
 
-    def _register_feedback_matrices(self):
-        """
-        Registers matrices and attaches a forward hook that applies a Tensor-level 
-        backward hook. This prevents gradient masking and combines DFA with L_seg.
-        """
+    def _register_local_hooks(self):
         net = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
         dummy = torch.zeros(1, 5, 64, 512, device=self.device)
@@ -444,7 +415,7 @@ class DFATrainer(_BaseHDTrainer):
 
         tmp_hooks = []
         for name, module in net.named_modules():
-            if name in self.dfa_layer_names:
+            if name in self.local_layer_names:
                 tmp_hooks.append(module.register_forward_hook(_shape_hook(name)))
 
         with torch.no_grad():
@@ -456,88 +427,87 @@ class DFATrainer(_BaseHDTrainer):
         for name, shape in shapes.items():
             C_l = shape[1] 
             B_l = torch.randn(self.hd_dim, C_l, device=self.device) / math.sqrt(self.hd_dim)
-            self._feedback[name] = B_l.half() 
+            self._local_rp[name] = B_l
 
             module = dict(net.named_modules())[name]
-            self._hooks.append(module.register_forward_hook(self._make_tensor_injection_hook(name)))
+            self._hooks.append(module.register_forward_hook(self._make_local_grad_hook(name)))
 
-    def _make_tensor_injection_hook(self, name: str):
+    def _make_local_grad_hook(self, name: str):
         def forward_hook(module, inp, out):
-            if not out.requires_grad:
-                return
+            if not out.requires_grad or not self.model.training or self._current_labels is None:
+                return out
+                
+            B, C_f, H, W = out.shape
             
-            def tensor_backward_hook(grad):
-                if name not in self._delta:
-                    return grad
-                delta = self._delta[name].to(grad.dtype)
-                if delta.shape[2:] != grad.shape[2:]:
-                    delta = F.interpolate(delta, size=grad.shape[2:], mode='bilinear', align_corners=False)
-                scale = self.scaler.get_scale() if hasattr(self, 'scaler') else 1.0
-                return grad + (delta.to(grad.dtype) * scale)
+            if self.use_pcgrad:
+                out_target = out.detach().clone()
+                out_target.requires_grad_(True)
+            else:
+                out_target = out
             
-            out.register_hook(tensor_backward_hook)
+            feats_flat = out_target.permute(0, 2, 3, 1).reshape(-1, C_f)
+            labels_flat = self._current_labels.reshape(-1)
+
+            valid_mask = labels_flat != self.ignore_index
+            valid_idx = valid_mask.nonzero(as_tuple=False).squeeze(1)
+            
+            if valid_idx.numel() > 0:
+                if valid_idx.numel() > self.margin_max_pixels:
+                    perm = torch.randperm(valid_idx.numel(), device=self.device)
+                    valid_idx = valid_idx[perm[:self.margin_max_pixels]]
+
+                feats_sub = feats_flat[valid_idx].float()
+                labels_sub = labels_flat[valid_idx]
+
+                rp_weight = self._local_rp[name].to(feats_sub.dtype)
+                s = feats_sub @ rp_weight.t()
+                q_norm = F.normalize(s, dim=1)
+                
+                local_loss = self.circle_loss(q_norm, labels_sub)
+                self._local_losses[name] = local_loss.item()
+                
+                scaled_loss = self.scaler.scale(local_loss) if hasattr(self, 'scaler') else local_loss
+                
+                if self.use_pcgrad:
+                    scaled_loss.backward()
+                    g_margin = out_target.grad
+                    if g_margin is not None:
+                        def tensor_backward_hook(g_seg):
+                            g_m = g_margin.to(g_seg.dtype)
+                            g_seg_flat = g_seg.reshape(-1)
+                            g_m_flat = g_m.reshape(-1)
+                            
+                            dot_product = torch.dot(g_seg_flat, g_m_flat)
+                            if dot_product < 0:
+                                seg_norm_sq = torch.dot(g_seg_flat, g_seg_flat) + 1e-8
+                                g_m = g_m - (dot_product / seg_norm_sq) * g_seg
+                            return g_seg + g_m
+                        out.register_hook(tensor_backward_hook)
+                    return out
+                else:
+                    scaled_loss.backward()
+                    return out.detach()
+
+            return out if self.use_pcgrad else out.detach()
+            
         return forward_hook
-
-    def _compute_dfa_deltas(self, feats: torch.Tensor, proj_labels: torch.Tensor):
-        """
-        Compute δ_l = (e · B_l) for each DFA layer l, where
-        e = hv_soft - proto_{y_i}  is the HD-space error.
-
-        Stores results in self._delta[name] for the backward hook to pick up.
-        Memory: uses margin_max_pixels subsampling before projecting to HD space.
-        """
-        B, C_f, H, W = feats.shape
-        feats_flat   = feats.detach().permute(0, 2, 3, 1).reshape(-1, C_f)
-        labels_flat  = proj_labels.reshape(-1)
-
-        valid_mask = labels_flat != self.ignore_index
-        valid_idx  = valid_mask.nonzero(as_tuple=False).squeeze(1)
-        if valid_idx.numel() == 0:
-            self._delta.clear()
-            return
-
-        if valid_idx.numel() > self.margin_max_pixels:
-            perm = torch.randperm(valid_idx.numel(), device=self.device)
-            valid_idx = valid_idx[perm[:self.margin_max_pixels]]
-
-        feats_sub  = feats_flat[valid_idx].clone().float().requires_grad_(True)
-        labels_sub = labels_flat[valid_idx]
-
-        with torch.enable_grad(), torch.amp.autocast('cuda', enabled=False):
-            s = feats_sub @ self.rp_weight.float().t()
-            s.retain_grad()
-            q_norm = F.normalize(s, dim=1)
-            loss = self.margin_lambda * self.circle_loss(q_norm, labels_sub)
-            loss.backward()
-            e = s.grad
-
-        for name, B_l in self._feedback.items():
-            delta_flat = e @ B_l.float()
-            C_l = delta_flat.shape[1]
-
-            delta_full = torch.zeros(B * H * W, C_l, device=self.device, dtype=delta_flat.dtype)
-            delta_full[valid_idx] = delta_flat
-            delta_spatial = (delta_full.reshape(B, H, W, C_l).permute(0, 3, 1, 2).contiguous())
-
-            self._delta[name] = delta_spatial
 
     def _train_epoch(self, loader, epoch, total_epochs):
         seg_m = AverageMeter()
-        margin_m = AverageMeter()
         acc_m = AverageMeter()
         iou_m = AverageMeter()
         self.model.train()
 
-        net = self.model.module if isinstance(
-            self.model, nn.DataParallel) else self.model
+        net = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
-        for in_vol, _, proj_labels, *_ in tqdm(loader, desc=f"[DFA] Train {epoch+1}/{total_epochs}"):
+        for in_vol, _, proj_labels, *_ in tqdm(loader, desc=f"[LocalGrad] Train {epoch+1}/{total_epochs}"):
             in_vol = in_vol.to(self.device)
             proj_labels = proj_labels.to(self.device).long()
             N = in_vol.size(0)
 
-            self.head_optimizer.zero_grad()
-            self.backbone_optimizer.zero_grad()
+            self.optimizer.zero_grad()
+            self._current_labels = proj_labels
+            self._local_losses.clear()
 
             with torch.amp.autocast('cuda'):
                 out = net(in_vol, return_feat=True, return_pre_feat=True)
@@ -550,43 +520,31 @@ class DFATrainer(_BaseHDTrainer):
                     pred, feats, pre_feats = out
                     seg_loss = self._seg_loss(pred, proj_labels)
 
-                margin_loss = self.margin_lambda * self._margin_loss_from_feats(feats, pre_feats, proj_labels)
-                margin_loss_val = margin_loss.item()
-
-                self._compute_dfa_deltas(feats.detach(), proj_labels)
-
             self.scaler.scale(seg_loss).backward()
-
-            self.scaler.unscale_(self.head_optimizer)
-            self.scaler.unscale_(self.backbone_optimizer)
-
-            delta_norm = sum(d.norm().item()**2 for d in self._delta.values())**0.5
-            grad_norm_backbone = sum(p.grad.norm().item()**2 for p in self.backbone_optimizer.param_groups[0]['params'] if p.grad is not None)**0.5
-            grad_norm_head = sum(p.grad.norm().item()**2 for p in self.head_optimizer.param_groups[0]['params'] if p.grad is not None)**0.5
 
             if hasattr(self, 'stats_file'):
                 self.global_step += 1
-                self.stats_file.write(f"{self.global_step},{delta_norm:.4f},{grad_norm_backbone:.4f},{grad_norm_head:.4f}\n")
+                l1 = self._local_losses.get("layer1", 0.0)
+                l2 = self._local_losses.get("layer2", 0.0)
+                l3 = self._local_losses.get("layer3", 0.0)
+                l4 = self._local_losses.get("layer4", 0.0)
+                self.stats_file.write(f"{self.global_step},{l1:.4f},{l2:.4f},{l3:.4f},{l4:.4f}\n")
                 self.stats_file.flush()
 
-            self.scaler.step(self.head_optimizer)
-            self.scaler.step(self.backbone_optimizer)
+            self.scaler.step(self.optimizer)
             self.scaler.update()
-
             self.scheduler.step()
-            self.backbone_scheduler.step()
 
-            self._delta.clear()
+            self._current_labels = None
 
             with torch.no_grad():
                 acc, jac = self._eval_metrics(pred, proj_labels)
 
             seg_m.update(seg_loss.item(), N)
-            margin_m.update(margin_loss_val, N)
             acc_m.update(acc.item(), N)
             iou_m.update(jac.item(), N)
 
-        return acc_m.avg, iou_m.avg, seg_m.avg, margin_m.avg
+        return acc_m.avg, iou_m.avg, seg_m.avg, 0.0
 
     def __del__(self):
         if hasattr(self, 'stats_file') and not self.stats_file.closed:

@@ -70,10 +70,20 @@ class HDCTrainer:
                     times.append(time.time() - t0)
                     continue
 
-                total_miss += is_wrong.sum().item()
-                w_labels = proj_labels[is_wrong]
-                w_argmax = argmax[is_wrong]
-                w_hv = hv[is_wrong].to(self.model.classify_weights.dtype)
+                # 5% subset of representative/hard samples to update the subclusters
+                PERCENTAGE = 0.05
+                num_wrong = is_wrong.sum().item()
+                num_to_keep = max(1, int(num_wrong * PERCENTAGE))
+
+                # Evaluate by looking at prediction confidence for the wrong samples
+                wrong_logits = logits[is_wrong]
+                max_wrong_logits = wrong_logits.max(dim=1)[0]
+                _, topk_indices = torch.topk(max_wrong_logits, num_to_keep)
+
+                total_miss += num_wrong
+                w_labels = proj_labels[is_wrong][topk_indices]
+                w_argmax = argmax[is_wrong][topk_indices]
+                w_hv = hv[is_wrong][topk_indices].to(self.model.classify_weights.dtype)
 
                 self.model.classify_weights.index_add_(0, w_labels, w_hv)
                 # self.model.classify_weights.index_add_(0, w_labels, w_hv)
@@ -106,6 +116,8 @@ class HDCTrainer:
                 logits, _ = self.model(proj_in)
                 times.append(time.time() - t0)
 
+                if hasattr(logits, 'as_subclass'):
+                    logits = logits.as_subclass(torch.Tensor)
                 preds = (logits.view(B, H, W, self.num_classes).permute(0, 3, 1, 2).argmax(dim=1))
                 evaluator.addBatch(preds, proj_labels)
 

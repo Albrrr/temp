@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 from dataset.parser import Parser
 from modules.resnet import ResNet10, ResNet18, ResNet34, ResNet50, ResNet101, ResNet152, get_model
-from modules.margin_trainers import TeZOTrainer, DFATrainer
+from modules.margin_trainers import MeZOTrainer, LocalGradTrainer
 from modules.trainer import CNNTrainer
 from modules.knowledge_distill import RKDDistiller
 from modules.hdc_model import HDCModel
@@ -120,39 +120,39 @@ def main():
     random_protos = F.normalize(random_protos, dim=1)
 
     if TRAIN_TEZO:
-        tezo_teacher_model = train_pipeline(TeZOTrainer, "TeZO", TEACHER_SIZE, num_classes, loss_weights, device, train_loader_fe, common_rp_weight)
+        tezo_teacher_model = train_pipeline(MeZOTrainer, "MeZO", TEACHER_SIZE, num_classes, loss_weights, device, train_loader_fe, common_rp_weight)
     else:
-        print("\n--- SKIPPED: TeZO Teacher Training ---")
+        print("\n--- SKIPPED: MeZO Teacher Training ---")
         tezo_teacher_model = get_model(TEACHER_SIZE, num_classes, aux=True)
-        ckpt_path = "logs/tezo_teacher/SENet"
+        ckpt_path = "logs/mezo_teacher/SENet"
         if os.path.exists(ckpt_path):
             tezo_teacher_model.load_state_dict(torch.load(ckpt_path)["state_dict"])
         tezo_teacher_model.to(device)
 
     if TRAIN_DFA:
-        dfa_teacher_model = train_pipeline(DFATrainer, "DFA", TEACHER_SIZE, num_classes, loss_weights, device, train_loader_fe, common_rp_weight)
+        dfa_teacher_model = train_pipeline(LocalGradTrainer, "LocalGrad", TEACHER_SIZE, num_classes, loss_weights, device, train_loader_fe, common_rp_weight)
     else:
-        print("\n--- SKIPPED: DFA Teacher Training ---")
+        print("\n--- SKIPPED: LocalGrad Teacher Training ---")
         dfa_teacher_model = get_model(TEACHER_SIZE, num_classes, aux=True)
-        ckpt_path = "logs/dfa_teacher/SENet"
+        ckpt_path = "logs/localgrad_teacher/SENet"
         if os.path.exists(ckpt_path):
             dfa_teacher_model.load_state_dict(torch.load(ckpt_path)["state_dict"])
         dfa_teacher_model.to(device)
 
     if TRAIN_STUDENT:
-        os.makedirs("logs/tezo_student", exist_ok=True)
-        os.makedirs("logs/dfa_student", exist_ok=True)
+        os.makedirs("logs/mezo_student", exist_ok=True)
+        os.makedirs("logs/localgrad_student", exist_ok=True)
         os.makedirs("logs/baseline", exist_ok=True)
 
-        print(f"\n--- Distilling TeZO Teacher -> Student ({STUDENT_SIZE}) ---")
+        print(f"\n--- Distilling MeZO Teacher -> Student ({STUDENT_SIZE}) ---")
         distiller_tezo = RKDDistiller(tezo_teacher_model, device)
-        tezo_student = distiller_tezo.distill(model_size=STUDENT_SIZE, dataloader=train_loader, epochs=DISTILLATION_EPOCHS, num_classes=num_classes, graph_name="TeZO")
-        torch.save({"state_dict": tezo_student.state_dict()}, "logs/tezo_student/SENet")
+        tezo_student = distiller_tezo.distill(model_size=STUDENT_SIZE, dataloader=train_loader, epochs=DISTILLATION_EPOCHS, num_classes=num_classes, graph_name="MeZO")
+        torch.save({"state_dict": tezo_student.state_dict()}, "logs/mezo_student/SENet")
 
-        print(f"\n--- Distilling DFA Teacher -> Student ({STUDENT_SIZE}) ---")
+        print(f"\n--- Distilling LocalGrad Teacher -> Student ({STUDENT_SIZE}) ---")
         distiller_dfa = RKDDistiller(dfa_teacher_model, device)
-        dfa_student = distiller_dfa.distill(model_size=STUDENT_SIZE, dataloader=train_loader, epochs=DISTILLATION_EPOCHS, num_classes=num_classes, graph_name="DFA")
-        torch.save({"state_dict": dfa_student.state_dict()}, "logs/dfa_student/SENet")
+        dfa_student = distiller_dfa.distill(model_size=STUDENT_SIZE, dataloader=train_loader, epochs=DISTILLATION_EPOCHS, num_classes=num_classes, graph_name="LocalGrad")
+        torch.save({"state_dict": dfa_student.state_dict()}, "logs/localgrad_student/SENet")
 
         print(f"\n--- Training Baseline Student ({STUDENT_SIZE}) ---")
         baseline_model = get_model(STUDENT_SIZE, num_classes, aux=False)
@@ -184,8 +184,8 @@ def main():
         protos = hdc_model.classify.weight.data.clone()
         return acc, protos
 
-    acc_tezo, protos_tezo = eval_hdc("logs/tezo_student/SENet", STUDENT_SIZE, "TeZO-Distilled")
-    acc_dfa, protos_dfa = eval_hdc("logs/dfa_student/SENet", STUDENT_SIZE, "DFA-Distilled")
+    acc_tezo, protos_tezo = eval_hdc("logs/mezo_student/SENet", STUDENT_SIZE, "MeZO-Distilled")
+    acc_dfa, protos_dfa = eval_hdc("logs/localgrad_student/SENet", STUDENT_SIZE, "LocalGrad-Distilled")
     acc_base, protos_base = eval_hdc("logs/baseline/SENet", STUDENT_SIZE, "Baseline")
 
     results = []
@@ -199,13 +199,13 @@ def main():
     dist_dfa = compute_proto_distances(protos_dfa) if protos_dfa is not None else None
     dist_base = compute_proto_distances(protos_base) if protos_base is not None else None
 
-    if acc_tezo is not None: results.append(f"{'TeZO -> Distill':<25} | {acc_tezo:<10.4f} | {dist_tezo.mean():<15.4f}")
-    if acc_dfa is not None: results.append(f"{'DFA -> Distill':<25} | {acc_dfa:<10.4f} | {dist_dfa.mean():<15.4f}")
+    if acc_tezo is not None: results.append(f"{'MeZO -> Distill':<25} | {acc_tezo:<10.4f} | {dist_tezo.mean():<15.4f}")
+    if acc_dfa is not None: results.append(f"{'LocalGrad -> Distill':<25} | {acc_dfa:<10.4f} | {dist_dfa.mean():<15.4f}")
     if acc_base is not None: results.append(f"{'Baseline (Standard)':<25} | {acc_base:<10.4f} | {dist_base.mean():<15.4f}")
     
     results.append("-" * 95)
     results.append("\nPairwise Distance Comparison:")
-    header = f"{'Classes':<10} | {'TeZO-Dist':<10} | {'DFA-Dist':<10} | {'Baseline':<10} | {'T-B Diff':<10}"
+    header = f"{'Classes':<10} | {'MeZO-Dist':<10} | {'Local-Dist':<10} | {'Baseline':<10} | {'T-B Diff':<10}"
     results.append(header)
     results.append("-" * len(header))
     

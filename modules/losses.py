@@ -114,18 +114,48 @@ class BoundaryLoss(nn.Module):
         loss = torch.mean(1 - BF1)
         return loss
 
-class DeCovLoss(nn.Module):
-    def __init__(self):
-        super(DeCovLoss, self).__init__()
+class VICRegLoss(nn.Module):
+    def __init__(self, sim_coeff=25.0, std_coeff=25.0, cov_coeff=1.0, gamma=1.0, eps=1e-4):
+        super(VICRegLoss, self).__init__()
+        self.sim_coeff = sim_coeff
+        self.std_coeff = std_coeff
+        self.cov_coeff = cov_coeff
+        self.gamma = gamma
+        self.eps = eps
 
-    def forward(self, x):
-        N = x.size(0)
+    def forward(self, x, y=None):
+        N, D = x.size()
         if N <= 1:
-            return torch.tensor(0.0, device=x.device)
-        x = x - x.mean(dim=0, keepdim=True)
-        cov = (x.t() @ x) / (N - 1)
-        cov_diag = torch.diag(cov)
-        loss = 0.5 * (cov.pow(2).sum() - cov_diag.pow(2).sum())
+            return torch.tensor(0.0, device=x.device, requires_grad=True)
+            
+        x_centered = x - x.mean(dim=0, keepdim=True)
+        
+        # Variance loss
+        std_x = torch.sqrt(x_centered.var(dim=0) + self.eps)
+        std_loss = torch.mean(F.relu(self.gamma - std_x))
+        
+        # Covariance loss
+        cov_x = (x_centered.t() @ x_centered) / (N - 1)
+        cov_loss = (cov_x.pow(2).sum() - torch.diag(cov_x).pow(2).sum()) / D
+        
+        loss = self.std_coeff * std_loss + self.cov_coeff * cov_loss
+        
+        if y is not None:
+            # If two views are provided, include the invariance loss
+            y_centered = y - y.mean(dim=0, keepdim=True)
+            
+            std_y = torch.sqrt(y_centered.var(dim=0) + self.eps)
+            std_loss_y = torch.mean(F.relu(self.gamma - std_y))
+            
+            cov_y = (y_centered.t() @ y_centered) / (N - 1)
+            cov_loss_y = (cov_y.pow(2).sum() - torch.diag(cov_y).pow(2).sum()) / D
+            
+            repr_loss = F.mse_loss(x, y)
+            
+            loss = self.sim_coeff * repr_loss + \
+                   self.std_coeff * (std_loss + std_loss_y) / 2 + \
+                   self.cov_coeff * (cov_loss + cov_loss_y) / 2
+
         return loss
 
 class ArcFaceLoss(nn.Module):
