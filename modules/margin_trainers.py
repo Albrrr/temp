@@ -178,8 +178,8 @@ class _BaseHDTrainer:
             perm = torch.randperm(valid_idx.numel(), device=self.device)
             valid_idx = valid_idx[perm[:self.margin_max_pixels]]
 
-        feats_sub = feats_flat[valid_idx]
-        pre_feats_sub = pre_feats_flat[valid_idx]
+        feats_sub = feats_flat[valid_idx].float()
+        pre_feats_sub = pre_feats_flat[valid_idx].float()
         labels_sub = labels_flat[valid_idx]
 
         s = feats_sub @ self.rp_weight.t()
