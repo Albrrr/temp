@@ -213,6 +213,7 @@ class MeZOTrainer(_BaseHDTrainer):
     DEFAULT_HEAD_NAMES = ("conv_1", "conv_2", "semantic_output", "aux_head")
 
     def __init__(self, num_classes: int, loss_weights: torch.Tensor, hd_dim: int, feat_dim: int = 128, log_dir: str = "logs", device: torch.device = torch.device("cpu"), zo_epsilon: float = 1e-3, zo_lr: float = 1e-5, head_param_names: Tuple[str, ...] = DEFAULT_HEAD_NAMES, use_pcgrad: bool = True, **base_kwargs):
+        base_kwargs.pop("num_epochs", None)
         super().__init__(num_classes, loss_weights, hd_dim, feat_dim, log_dir, device, **base_kwargs)
         self.zo_epsilon = zo_epsilon
         self.zo_lr = zo_lr
