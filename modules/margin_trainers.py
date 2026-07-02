@@ -447,7 +447,12 @@ class LocalGradTrainer(_BaseHDTrainer):
                 out_target = out
             
             feats_flat = out_target.permute(0, 2, 3, 1).reshape(-1, C_f)
-            labels_flat = self._current_labels.reshape(-1)
+                        
+            labels = self._current_labels
+            if labels.shape[1] != H or labels.shape[2] != W:
+                labels = F.interpolate(labels.unsqueeze(1).float(), size=(H, W), mode='nearest').squeeze(1).long()
+            
+            labels_flat = labels.reshape(-1)
 
             valid_mask = labels_flat != self.ignore_index
             valid_idx = valid_mask.nonzero(as_tuple=False).squeeze(1)
